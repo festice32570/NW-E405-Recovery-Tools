@@ -4,7 +4,7 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.2-dev
+## GUI版 v0.2.1-dev
 
 現在の推奨版は **`NW-E405-Recovery-Tool.exe`** です。
 
@@ -24,7 +24,7 @@ NW-E405_diag_YYYYMMDD_HHMMSS.txt
 
 6. **「結果をコピー」** またはログファイルを使って結果を共有してください。
 
-## v0.2-devで実行する処理
+## v0.2.1-devで実行する処理
 
 Stage 1は意図的に **READ-ONLY** です。
 
@@ -47,7 +47,23 @@ Stage 1は意図的に **READ-ONLY** です。
 - ファームウェア書き込み
 - Sony更新開始コマンド `0xFC / 0x04`
 
-そのため、v0.2-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
+そのため、v0.2.1-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
+
+
+## 機種判定の検証
+
+NW-E405のUSB IDは **Sony VID 054C / PID 01FB** として確認しています。
+
+v0.2.1-devでは、Sony製だからという理由だけで独自コマンドを送らないように判定を強化しました。
+
+1. PnP上に `USB\VID_054C&PID_01FB` が存在することを確認
+2. Disk interfaceの親デバイスをPnPツリーで遡り、同じVID/PIDへ到達することを確認
+3. SCSI INQUIRYが公式Updaterの `ProductInfo=NWWM MEM AAD2` と整合することを確認
+4. 上記すべてを満たしたDisk interfaceに限ってSony `0xFC/0x03` を送信
+
+`NWWM MEM AAD2` は他のSonyプレーヤーでも使われる例があるため、**この文字列単独ではNW-E405判定に使用しません**。
+
+Disk interfaceが取得できない場合は、Explorerに残っているリムーバブルドライブ文字を読み取り専用で調べるフォールバックを行います。この経路では安全のためSony独自 `0xFC` コマンドを送信しません。
 
 ## 想定している故障状態
 
@@ -113,7 +129,7 @@ chkdsk /f
 - [x] Sony公式Updaterの構造解析
 - [x] FWUpdaterCom.dllのSCSI経路確認
 - [x] PowerShell READ-ONLY prototype v0.1
-- [x] Windows 7対応ネイティブGUI v0.2-dev
+- [x] Windows 7対応ネイティブGUI v0.2.1-dev
 - [ ] 故障実機からGUI版ログ収集
 - [ ] SONYSPTI / scsipath経路への対応
 - [ ] Sony vendor command応答の詳細解析
@@ -143,4 +159,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.2-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
+**v0.2.1-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**

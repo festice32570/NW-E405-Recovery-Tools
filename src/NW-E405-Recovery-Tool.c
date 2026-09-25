@@ -2,6 +2,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #include <ntddscsi.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -10,7 +11,7 @@
 #include <wchar.h>
 #include <shellapi.h>
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.2-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.2.1-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -25,6 +26,7 @@ static HWND g_status = NULL;
 static HWND g_scan = NULL;
 static WCHAR g_logPath[MAX_PATH] = {0};
 static WCHAR g_exeDir[MAX_PATH] = {0};
+static BOOL g_exactUsbPresent = FALSE;
 
 typedef struct {
     SCSI_PASS_THROUGH_DIRECT sptd;
@@ -118,7 +120,7 @@ static HANDLE OpenDeviceRW(const WCHAR *path, DWORD *err) {
     return h;
 }
 
-static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen, BOOL dataIn) {
+static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen) {
     ScsiResult r;
     ZeroMemory(&r, sizeof(r));
     if (h == INVALID_HANDLE_VALUE) return r;
@@ -139,7 +141,7 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen,
     pkt.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
     pkt.sptd.CdbLength = cdbLen;
     pkt.sptd.SenseInfoLength = sizeof(pkt.sense);
-    pkt.sptd.DataIn = dataLen ? (dataIn ? SCSI_IOCTL_DATA_IN : SCSI_IOCTL_DATA_OUT) : SCSI_IOCTL_DATA_UNSPECIFIED;
+    pkt.sptd.DataIn = dataLen ? SCSI_IOCTL_DATA_IN : SCSI_IOCTL_DATA_UNSPECIFIED;
     pkt.sptd.DataTransferLength = dataLen;
     pkt.sptd.TimeOutValue = 8;
     pkt.sptd.DataBuffer = data;
@@ -192,8 +194,9 @@ static void GetDevProp(HDEVINFO set, SP_DEVINFO_DATA *dev, DWORD prop, WCHAR *ou
         out[0] = 0;
 }
 
-static BOOL FindUsbVidPid(void) {
-    BOOL found = FALSE;
+static BOOL ScanSonyUsbDevices(void) {
+    BOOL exact = FALSE;
+    BOOL anySony = FALSE;
     HDEVINFO set = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (set == INVALID_HANDLE_VALUE) return FALSE;
 
@@ -204,23 +207,131 @@ static BOOL FindUsbVidPid(void) {
         DWORD type = 0, req = 0;
         if (SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID, &type,
             (PBYTE)ids, sizeof(ids), &req)) {
-            if (ContainsI(ids, SONY_VIDPID)) {
+            if (ContainsI(ids, L"VID_054C")) {
                 WCHAR name[512] = {0};
                 GetDevProp(set, &dev, SPDRP_FRIENDLYNAME, name, 512);
                 if (!name[0]) GetDevProp(set, &dev, SPDRP_DEVICEDESC, name, 512);
-                LogF(L"USB/PnP: FOUND  %s", name[0] ? name : L"(unnamed device)");
-                LogF(L"Hardware ID: %s", ids);
-                found = TRUE;
+                LogF(L"SONY USB: %s", name[0] ? name : L"(unnamed device)");
+                LogF(L"  Hardware ID: %s", ids);
+                anySony = TRUE;
+                if (ContainsI(ids, SONY_VIDPID)) {
+                    exact = TRUE;
+                    LogF(L"  >>> Exact NW-E405 USB ID match (054C:01FB)");
+                }
             }
         }
         dev.cbSize = sizeof(dev);
     }
     SetupDiDestroyDeviceInfoList(set);
-    if (!found) LogF(L"USB/PnP: VID_054C&PID_01FB was not found.");
+    if (!anySony) LogF(L"No present Sony USB device (VID_054C) was found.");
+    if (!exact) LogF(L"Exact NW-E405 ID VID_054C&PID_01FB was not found.");
+    g_exactUsbPresent = exact;
+    return exact;
+}
+
+static BOOL DevNodeHasExactNwE405Ancestor(DEVINST devInst) {
+    DEVINST cur = devInst;
+    for (int depth = 0; depth < 12; ++depth) {
+        WCHAR id[MAX_DEVICE_ID_LEN] = {0};
+        if (CM_Get_Device_IDW(cur, id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
+            if (ContainsI(id, SONY_VIDPID))
+                return TRUE;
+        }
+        DEVINST parent = 0;
+        if (CM_Get_Parent(&parent, cur, 0) != CR_SUCCESS)
+            break;
+        cur = parent;
+    }
+    return FALSE;
+}
+
+static BOOL ProbeDriveLetterReadOnly(WCHAR letter) {
+    WCHAR root[4] = { letter, L':', L'\\', 0 };
+    if (GetDriveTypeW(root) != DRIVE_REMOVABLE)
+        return FALSE;
+
+    WCHAR path[8];
+    _snwprintf(path, 8, L"\\\\.\\%c:", letter);
+
+    DWORD err = 0;
+    HANDLE h = OpenDeviceRW(path, &err);
+    LogF(L"Drive-letter fallback: %c:", letter);
+    if (h == INVALID_HANDLE_VALUE) {
+        LogF(L"  Open failed: Win32=%lu", err);
+        LogF(L"");
+        return FALSE;
+    }
+
+    BYTE cdb[16] = {0};
+    cdb[0] = 0x12;
+    cdb[4] = 96;
+    ScsiResult inq = SendCdb(h, cdb, 6, 96);
+
+    WCHAR vendor[32] = {0}, product[64] = {0}, rev[16] = {0};
+    if (inq.ioctlOk && inq.scsiStatus == 0 && inq.dataLen >= 36) {
+        BytesToAscii(inq.data, 8, 8, vendor, 32);
+        BytesToAscii(inq.data, 16, 16, product, 64);
+        BytesToAscii(inq.data, 32, 4, rev, 16);
+        LogF(L"  INQUIRY: Vendor=[%s] Product=[%s] Rev=[%s]", vendor, product, rev);
+    } else {
+        LogF(L"  INQUIRY failed (IOCTL=%d, Status=0x%02X, Win32=%lu)",
+            inq.ioctlOk, inq.scsiStatus, inq.winErr);
+        CloseHandle(h);
+        LogF(L"");
+        return FALSE;
+    }
+
+    BOOL expectedInquiry =
+        ContainsI(vendor, L"SONY") &&
+        ContainsI(product, L"NWWM MEM AAD2");
+
+    if (!expectedInquiry) {
+        LogF(L"  Not the expected SONY / NWWM MEM AAD2 identity; skipped.");
+        CloseHandle(h);
+        LogF(L"");
+        return FALSE;
+    }
+
+    LogF(L"  Expected SCSI identity found via drive letter.");
+    ShowScsiResult(L"SCSI INQUIRY (drive-letter fallback)", &inq);
+
+    ZeroMemory(cdb, sizeof(cdb));
+    cdb[0] = 0x00;
+    ScsiResult tur = SendCdb(h, cdb, 6, 0);
+    ShowScsiResult(L"TEST UNIT READY (drive-letter fallback)", &tur);
+
+    ZeroMemory(cdb, sizeof(cdb));
+    cdb[0] = 0x03;
+    cdb[4] = 64;
+    ScsiResult rs = SendCdb(h, cdb, 6, 64);
+    ShowScsiResult(L"REQUEST SENSE (drive-letter fallback)", &rs);
+
+    ZeroMemory(cdb, sizeof(cdb));
+    cdb[0] = 0x25;
+    ScsiResult cap = SendCdb(h, cdb, 10, 8);
+    ShowScsiResult(L"READ CAPACITY(10) (drive-letter fallback)", &cap);
+
+    LogF(L"SAFETY: Sony vendor command is NOT sent through the drive-letter fallback");
+    LogF(L"because this path cannot be bound conclusively to USB VID_054C&PID_01FB.");
+    LogF(L"");
+
+    CloseHandle(h);
+    return TRUE;
+}
+
+static int ProbeRemovableDriveLetters(void) {
+    DWORD mask = GetLogicalDrives();
+    int found = 0;
+    for (WCHAR c = L'A'; c <= L'Z'; ++c) {
+        if (mask & (1u << (c - L'A'))) {
+            if (ProbeDriveLetterReadOnly(c))
+                found++;
+        }
+    }
     return found;
 }
 
-static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int index) {
+static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int index, BOOL exactMapped) {
     DWORD err = 0;
     HANDLE h = OpenDeviceRW(path, &err);
     LogF(L"Disk interface #%d: %s", index, friendly && friendly[0] ? friendly : L"(no friendly name)");
@@ -233,7 +344,7 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
     BYTE cdb[16] = {0};
     cdb[0] = 0x12;
     cdb[4] = 96;
-    ScsiResult inq = SendCdb(h, cdb, 6, 96, TRUE);
+    ScsiResult inq = SendCdb(h, cdb, 6, 96);
 
     WCHAR vendor[32] = {0}, product[64] = {0}, rev[16] = {0};
     if (inq.ioctlOk && inq.scsiStatus == 0 && inq.dataLen >= 36) {
@@ -246,35 +357,37 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
             inq.ioctlOk, inq.scsiStatus, inq.winErr);
     }
 
-    BOOL sony = ContainsI(vendor, L"SONY") || ContainsI(product, L"NWWM") ||
-                ContainsI(product, L"NW-E40") || (friendly && ContainsI(friendly, L"SONY"));
+    BOOL expectedInquiry =
+        ContainsI(vendor, L"SONY") &&
+        ContainsI(product, L"NWWM MEM AAD2");
 
-    if (!sony) {
-        LogF(L"  Not identified as Sony/NW-E405; vendor-specific commands skipped.");
+    if (!expectedInquiry) {
+        LogF(L"  Not the expected SONY / NWWM MEM AAD2 SCSI identity; skipped.");
         LogF(L"");
         CloseHandle(h);
         return FALSE;
     }
 
-    LogF(L"  >>> Sony/NW-E405 candidate selected for read-only diagnostics.");
+    LogF(L"  Expected SCSI identity found.");
+    LogF(L"  USB parent mapping to VID_054C&PID_01FB: %s", exactMapped ? L"YES" : L"NO");
     LogF(L"");
 
     ShowScsiResult(L"SCSI INQUIRY", &inq);
 
     ZeroMemory(cdb, sizeof(cdb));
     cdb[0] = 0x00;
-    ScsiResult tur = SendCdb(h, cdb, 6, 0, TRUE);
+    ScsiResult tur = SendCdb(h, cdb, 6, 0);
     ShowScsiResult(L"TEST UNIT READY", &tur);
 
     ZeroMemory(cdb, sizeof(cdb));
     cdb[0] = 0x03;
     cdb[4] = 64;
-    ScsiResult rs = SendCdb(h, cdb, 6, 64, TRUE);
+    ScsiResult rs = SendCdb(h, cdb, 6, 64);
     ShowScsiResult(L"REQUEST SENSE", &rs);
 
     ZeroMemory(cdb, sizeof(cdb));
     cdb[0] = 0x25;
-    ScsiResult cap = SendCdb(h, cdb, 10, 8, TRUE);
+    ScsiResult cap = SendCdb(h, cdb, 10, 8);
     ShowScsiResult(L"READ CAPACITY(10)", &cap);
     if (cap.ioctlOk && cap.scsiStatus == 0 && cap.dataLen >= 8) {
         uint32_t last = ((uint32_t)cap.data[0] << 24) | ((uint32_t)cap.data[1] << 16) |
@@ -286,18 +399,23 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
         LogF(L"");
     }
 
-    ZeroMemory(cdb, sizeof(cdb));
-    cdb[0] = 0xFC;
-    cdb[2] = 0x03;
-    cdb[7] = 0x00;
-    cdb[8] = 0x40;
-    ScsiResult sonyInfo = SendCdb(h, cdb, 12, 64, TRUE);
-    ShowScsiResult(L"SONY 0xFC/0x03 (read-only firmware info)", &sonyInfo);
+    if (exactMapped) {
+        ZeroMemory(cdb, sizeof(cdb));
+        cdb[0] = 0xFC;
+        cdb[2] = 0x03;
+        cdb[7] = 0x00;
+        cdb[8] = 0x40;
+        ScsiResult sonyInfo = SendCdb(h, cdb, 12, 64);
+        ShowScsiResult(L"SONY 0xFC/0x03 (read-only vendor query)", &sonyInfo);
 
-    if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0)
-        LogF(L"RESULT: Sony vendor-command processor responded. Stage-2 software recovery may be possible.");
-    else
-        LogF(L"RESULT: Sony vendor read command did not complete successfully.");
+        if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0)
+            LogF(L"RESULT: Sony vendor-command processor responded. Stage-2 software recovery may be possible.");
+        else
+            LogF(L"RESULT: Sony vendor read command did not complete successfully.");
+    } else {
+        LogF(L"SAFETY: Sony vendor command skipped because this disk interface was not");
+        LogF(L"mapped through the PnP tree to USB VID_054C&PID_01FB.");
+    }
 
     LogF(L"");
     CloseHandle(h);
@@ -337,7 +455,8 @@ static int EnumerateDisks(void) {
             WCHAR friendly[512] = {0};
             GetDevProp(set, &dev, SPDRP_FRIENDLYNAME, friendly, 512);
             if (!friendly[0]) GetDevProp(set, &dev, SPDRP_DEVICEDESC, friendly, 512);
-            if (ProbeDiskInterface(detail->DevicePath, friendly, (int)i))
+            BOOL exactMapped = DevNodeHasExactNwE405Ancestor(dev.DevInst);
+            if (ProbeDiskInterface(detail->DevicePath, friendly, (int)i, exactMapped))
                 sonyCount++;
         }
         HeapFree(GetProcessHeap(), 0, detail);
@@ -391,21 +510,32 @@ static void RunDiagnostics(void) {
     LogF(L"Sony update-start command (0xFC/0x04) を実行しません。");
     LogF(L"");
 
-    BOOL usb = FindUsbVidPid();
+    BOOL usb = ScanSonyUsbDevices();
     LogF(L"");
     int sony = EnumerateDisks();
+    int fallback = 0;
+    if (sony == 0) {
+        LogF(L"");
+        LogF(L"No matching disk interface found. Trying read-only removable-drive fallback...");
+        fallback = ProbeRemovableDriveLetters();
+    }
 
     LogF(L"=== SUMMARY ===");
-    LogF(L"USB VID/PID found: %s", usb ? L"YES" : L"NO");
-    LogF(L"Sony/NW-E405 disk candidates: %d", sony);
+    LogF(L"Exact USB VID/PID 054C:01FB found: %s", usb ? L"YES" : L"NO");
+    LogF(L"Mapped SONY/NWWM disk candidates: %d", sony);
+    LogF(L"Drive-letter fallback matches: %d", fallback);
 
-    if (sony == 0 && usb) {
+    if (sony == 0 && fallback > 0 && usb) {
         LogF(L"");
-        LogF(L"USBデバイス自体は見えていますが、SCSI Disk interfaceを取得できませんでした。");
-        LogF(L"この場合はSONYSPTI経路を使う次段階の調査対象です。");
-    } else if (sony == 0) {
+        LogF(L"NW-E405-like SCSI identity is reachable via a drive letter, but the");
+        LogF(L"disk-interface mapping was unavailable. Vendor commands were skipped for safety.");
+    } else if (sony == 0 && fallback == 0 && usb) {
         LogF(L"");
-        LogF(L"NW-E405を検出できませんでした。ケーブル、USBポート、ドライバを確認してください。");
+        LogF(L"USB VID/PID is present, but no usable SCSI path was found.");
+        LogF(L"Next target: Sony's original SONYSPTI/scsipath access path.");
+    } else if (sony == 0 && fallback == 0) {
+        LogF(L"");
+        LogF(L"NW-E405 could not be identified. Check cable, USB port and driver state.");
     }
 
     LogF(L"");
