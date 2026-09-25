@@ -10,12 +10,13 @@
 #include <string.h>
 #include <shellapi.h>
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.3.1-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.4-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
 #define ID_FOLDER 1003
 #define ID_GITHUB 1004
+#define ID_RECOVER 1005
 #define ID_OUTPUT 1101
 #define ID_STATUS 1102
 
@@ -23,6 +24,10 @@ static HWND g_hwnd = NULL;
 static HWND g_output = NULL;
 static HWND g_status = NULL;
 static HWND g_scan = NULL;
+static HWND g_recover = NULL;
+static BOOL g_recoveryEligible = FALSE;
+
+static BOOL SaveLog(void);
 static WCHAR g_logPath[MAX_PATH] = {0};
 static WCHAR g_exeDir[MAX_PATH] = {0};
 static BOOL g_exactUsbPresent = FALSE;
@@ -167,6 +172,19 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
 
 static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen) {
     return SendCdbEx(h, cdb, cdbLen, dataLen, 0);
+}
+
+
+static BOOL IsNoMediaResult(const ScsiResult *r) {
+    return r && r->ioctlOk && r->scsiStatus == 0x02 &&
+           ((r->sense[2] & 0x0F) == 0x02) &&
+           r->sense[12] == 0x3A && r->sense[13] == 0x00;
+}
+
+static BOOL IsIssue1FwInfo(const ScsiResult *r) {
+    static const BYTE expected[8] = {0x01,0x00,0x0D,0x00,0x20,0x02,0x00,0x00};
+    return r && r->ioctlOk && r->scsiStatus == 0x00 && r->dataLen >= 8 &&
+           memcmp(r->data, expected, sizeof(expected)) == 0;
 }
 
 static void ShowScsiResult(const WCHAR *name, const ScsiResult *r) {
@@ -551,10 +569,18 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
         ScsiResult sonyInfo = SendCdb(h, cdb, 12, 8);
         ShowScsiResult(L"SONY 0xFC/0x03 (read-only vendor query)", &sonyInfo);
 
-        if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0)
+        if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0) {
             LogF(L"RESULT: Sony vendor-command processor responded. Stage-2 software recovery may be possible.");
-        else
+            if (IsNoMediaResult(&tur) && IsNoMediaResult(&cap) && IsIssue1FwInfo(&sonyInfo)) {
+                g_recoveryEligible = TRUE;
+                LogF(L"RECOVERY PREFLIGHT: MATCH — Issue #1 resume conditions satisfied.");
+                LogF(L"Known FW info: 01 00 0D 00 20 02 00 00");
+            } else {
+                LogF(L"RECOVERY PREFLIGHT: NOT MATCHED — FC/04 remains locked.");
+            }
+        } else {
             LogF(L"RESULT: Sony vendor read command did not complete successfully.");
+        }
     } else {
         LogF(L"SAFETY: Sony vendor command skipped because this disk interface was not");
         LogF(L"mapped through the PnP tree to USB VID_054C&PID_01FB.");
@@ -563,6 +589,162 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
     LogF(L"");
     CloseHandle(h);
     return TRUE;
+}
+
+
+static HANDLE OpenIssue1RecoveryTarget(void) {
+    HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, NULL, NULL,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) {
+        LogF(L"RECOVERY: Disk enumeration failed: %lu", GetLastError());
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE result = INVALID_HANDLE_VALUE;
+    for (DWORD i = 0; result == INVALID_HANDLE_VALUE; ++i) {
+        SP_DEVICE_INTERFACE_DATA ifc;
+        ZeroMemory(&ifc, sizeof(ifc));
+        ifc.cbSize = sizeof(ifc);
+        if (!SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_DISK, i, &ifc)) {
+            if (GetLastError() == ERROR_NO_MORE_ITEMS) break;
+            continue;
+        }
+
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifc, NULL, 0, &need, NULL);
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail =
+            (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, need);
+        if (!detail) continue;
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        SP_DEVINFO_DATA dev;
+        ZeroMemory(&dev, sizeof(dev));
+        dev.cbSize = sizeof(dev);
+
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifc, detail, need, NULL, &dev) &&
+            DevNodeHasExactNwE405Ancestor(dev.DevInst)) {
+            DWORD err = 0;
+            HANDLE h = OpenDeviceRW(detail->DevicePath, &err);
+            if (h != INVALID_HANDLE_VALUE) {
+                BYTE cdb[16] = {0};
+                cdb[0] = 0x12; cdb[4] = 96;
+                ScsiResult inq = SendCdb(h, cdb, 6, 96);
+                WCHAR vendor[32] = {0}, product[64] = {0};
+                if (inq.ioctlOk && inq.scsiStatus == 0 && inq.dataLen >= 36) {
+                    BytesToAscii(inq.data, 8, 8, vendor, 32);
+                    BytesToAscii(inq.data, 16, 16, product, 64);
+                }
+
+                BOOL identity = ContainsI(vendor, L"SONY") && ContainsI(product, L"NWWM MEM AAD2");
+                if (identity) {
+                    ZeroMemory(cdb, sizeof(cdb)); cdb[0] = 0x00;
+                    ScsiResult tur = SendCdb(h, cdb, 6, 0);
+                    ZeroMemory(cdb, sizeof(cdb)); cdb[0] = 0x25;
+                    ScsiResult cap = SendCdb(h, cdb, 10, 8);
+                    ZeroMemory(cdb, sizeof(cdb));
+                    cdb[0] = 0xFC; cdb[2] = 0x03; cdb[8] = 0x08;
+                    ScsiResult fw = SendCdb(h, cdb, 12, 8);
+
+                    LogF(L"RECOVERY re-check: identity=%s TUR-3A00=%s CAP-3A00=%s FW-info=%s",
+                        identity ? L"YES" : L"NO",
+                        IsNoMediaResult(&tur) ? L"YES" : L"NO",
+                        IsNoMediaResult(&cap) ? L"YES" : L"NO",
+                        IsIssue1FwInfo(&fw) ? L"MATCH" : L"NO");
+
+                    if (IsNoMediaResult(&tur) && IsNoMediaResult(&cap) && IsIssue1FwInfo(&fw)) {
+                        result = h;
+                    } else {
+                        CloseHandle(h);
+                    }
+                } else {
+                    CloseHandle(h);
+                }
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, detail);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return result;
+}
+
+static void RunRecovery(void) {
+    if (!g_recoveryEligible) {
+        MessageBoxW(g_hwnd,
+            L"復旧条件が確認できていません。先に『NW-E405を診断する』を実行してください。",
+            L"Recovery locked", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    int ans = MessageBoxW(g_hwnd,
+        L"これはIssue #1の個体専用の実験的な更新再開処理です。\n\n"
+        L"前提:\n"
+        L"・NW-E405 (VID 054C / PID 01FB)\n"
+        L"・Ver.1.x → 2.0更新が99%付近で失敗\n"
+        L"・MEMORY ERROR / No Media\n"
+        L"・FC/03の8バイト応答が既知値と一致\n\n"
+        L"続行すると、Sony純正Updaterが使う更新開始コマンド FC/04 を送信します。\n"
+        L"内部に残っているMSFWUPGR.UPGが不完全な場合、状態が悪化する可能性があります。\n\n"
+        L"この個体で更新再開を試しますか？",
+        L"NW-E405 Experimental Recovery", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (ans != IDYES) return;
+
+    g_recoveryEligible = FALSE;
+    EnableWindow(g_scan, FALSE);
+    EnableWindow(g_recover, FALSE);
+    SetStatus(L"復旧前チェック中... USBを抜かないでください");
+    LogF(L"");
+    LogF(L"=== EXPERIMENTAL RECOVERY / ISSUE #1 ===");
+    LogF(L"Re-validating device state immediately before FC/04...");
+
+    BOOL usb = ScanSonyUsbDevices();
+    if (!usb) {
+        LogF(L"ABORT: exact USB VID/PID is no longer present.");
+        SetStatus(L"復旧中止 — NW-E405を確認できません");
+        EnableWindow(g_scan, TRUE);
+        SaveLog();
+        return;
+    }
+
+    HANDLE h = OpenIssue1RecoveryTarget();
+    if (h == INVALID_HANDLE_VALUE) {
+        LogF(L"ABORT: recovery preflight no longer matches. FC/04 was NOT sent.");
+        SetStatus(L"復旧中止 — 条件が一致しません（FC/04未送信）");
+        EnableWindow(g_scan, TRUE);
+        SaveLog();
+        return;
+    }
+
+    LogF(L"All recovery gates passed.");
+    LogF(L"Sending original Sony update-start CDB: FC 00 04 00 00 00 00 00 00 00 00 00");
+    SetStatus(L"FC/04送信中... USBを抜かないでください");
+
+    BYTE cdb[16] = {0};
+    cdb[0] = 0xFC;
+    cdb[2] = 0x04;
+    ScsiResult r = SendCdb(h, cdb, 12, 0);
+    ShowScsiResult(L"SONY 0xFC/0x04 UPDATE START", &r);
+    CloseHandle(h);
+
+    if (r.ioctlOk && r.scsiStatus == 0x00) {
+        LogF(L"RECOVERY: FC/04 was accepted with SCSI GOOD status.");
+        LogF(L"Do NOT disconnect the Walkman while it processes/reboots.");
+        LogF(L"After the device settles, run Diagnostics again and attach the new log to Issue #1.");
+        SetStatus(L"FC/04 accepted — 本体処理中はUSBを抜かないでください");
+        MessageBoxW(g_hwnd,
+            L"FC/04はSCSI GOODで受理されました。\n\n本体が処理・再起動している間はUSBを抜かないでください。\n"
+            L"状態が落ち着いたら、もう一度『NW-E405を診断する』を実行してください。",
+            L"Recovery command accepted", MB_OK | MB_ICONINFORMATION);
+    } else {
+        LogF(L"RECOVERY: FC/04 was NOT accepted successfully.");
+        LogF(L"No further write/update command will be attempted automatically.");
+        SetStatus(L"FC/04失敗 — 追加処理は実行していません");
+        MessageBoxW(g_hwnd,
+            L"FC/04は正常に受理されませんでした。追加の更新命令は送っていません。\nログをIssue #1へ添付してください。",
+            L"Recovery command failed", MB_OK | MB_ICONERROR);
+    }
+
+    SaveLog();
+    EnableWindow(g_scan, TRUE);
 }
 
 static int EnumerateDisks(void) {
@@ -642,15 +824,17 @@ static BOOL SaveLog(void) {
 }
 
 static void RunDiagnostics(void) {
+    g_recoveryEligible = FALSE;
     EnableWindow(g_scan, FALSE);
+    if (g_recover) EnableWindow(g_recover, FALSE);
     SetWindowTextW(g_output, L"");
     SetStatus(L"診断中... USBを抜かないでください");
 
     LogF(L"%s", APP_TITLE);
-    LogF(L"Stage 1: READ-ONLY diagnostic build");
+    LogF(L"Diagnostic scan is READ-ONLY.");
     LogF(L"");
-    LogF(L"このバージョンはフォーマット、セクタ書込み、FW書込み、");
-    LogF(L"Sony update-start command (0xFC/0x04) を実行しません。");
+    LogF(L"診断ボタンはフォーマット、セクタ書込み、FW書込み、FC/04を実行しません。");
+    LogF(L"FC/04はIssue #1の既知状態と一致した後、復旧ボタンで明示確認した場合のみ送信します。");
     LogF(L"");
 
     BOOL usb = ScanSonyUsbDevices();
@@ -697,6 +881,7 @@ static void RunDiagnostics(void) {
     }
 
     EnableWindow(g_scan, TRUE);
+    if (g_recover) EnableWindow(g_recover, g_recoveryEligible);
 }
 
 static void CopyOutput(void) {
@@ -746,28 +931,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(title, WM_SETFONT, (WPARAM)fTitle, TRUE);
 
             HWND sub = CreateWindowW(L"STATIC",
-                L"開発中 / Stage 1は読み取り専用です。NW-E405をUSBへ接続して診断してください。",
+                L"開発中 / 診断後、Issue #1の条件一致時のみ実験的な更新再開が可能です。",
                 WS_CHILD | WS_VISIBLE, 20, 48, 720, 24, hwnd, NULL, NULL, NULL);
             SendMessageW(sub, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             g_scan = CreateWindowW(L"BUTTON", L"NW-E405を診断する",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                20, 80, 190, 38, hwnd, (HMENU)ID_SCAN, NULL, NULL);
+                20, 80, 170, 38, hwnd, (HMENU)ID_SCAN, NULL, NULL);
             SendMessageW(g_scan, WM_SETFONT, (WPARAM)fNormal, TRUE);
+
+            g_recover = CreateWindowW(L"BUTTON", L"更新再開を試す",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                200, 80, 150, 38, hwnd, (HMENU)ID_RECOVER, NULL, NULL);
+            SendMessageW(g_recover, WM_SETFONT, (WPARAM)fNormal, TRUE);
+            EnableWindow(g_recover, FALSE);
 
             HWND copy = CreateWindowW(L"BUTTON", L"結果をコピー",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                220, 80, 125, 38, hwnd, (HMENU)ID_COPY, NULL, NULL);
+                360, 80, 115, 38, hwnd, (HMENU)ID_COPY, NULL, NULL);
             SendMessageW(copy, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND folder = CreateWindowW(L"BUTTON", L"ログフォルダ",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                355, 80, 125, 38, hwnd, (HMENU)ID_FOLDER, NULL, NULL);
+                485, 80, 115, 38, hwnd, (HMENU)ID_FOLDER, NULL, NULL);
             SendMessageW(folder, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND github = CreateWindowW(L"BUTTON", L"GitHub",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                490, 80, 100, 38, hwnd, (HMENU)ID_GITHUB, NULL, NULL);
+                610, 80, 100, 38, hwnd, (HMENU)ID_GITHUB, NULL, NULL);
             SendMessageW(github, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             g_output = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -785,6 +976,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND:
             switch (LOWORD(wp)) {
                 case ID_SCAN: RunDiagnostics(); return 0;
+                case ID_RECOVER: RunRecovery(); return 0;
                 case ID_COPY: CopyOutput(); return 0;
                 case ID_FOLDER:
                     ShellExecuteW(hwnd, L"open", g_exeDir, NULL, NULL, SW_SHOWNORMAL);

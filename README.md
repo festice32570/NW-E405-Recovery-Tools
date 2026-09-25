@@ -7,7 +7,7 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.3.1-dev
+## GUI版 v0.4-dev
 
 現在の推奨版は **`NW-E405-Recovery-Tool.exe`** です。
 
@@ -27,7 +27,7 @@ NW-E405_diag_YYYYMMDD_HHMMSS.txt
 
 6. **「結果をコピー」** またはログファイルを使って結果を共有してください。
 
-## v0.3.1-devで実行する処理
+## v0.4-devで実行する処理
 
 Stage 1は意図的に **READ-ONLY** です。
 
@@ -50,10 +50,41 @@ Stage 1は意図的に **READ-ONLY** です。
 - ファームウェア書き込み
 - Sony更新開始コマンド `0xFC / 0x04`
 
-そのため、v0.3.1-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
+そのため、v0.4-devは **診断＋Issue #1専用の実験的な更新再開版** です。
 
 
 
+
+
+## v0.4-dev: Issue #1 専用の実験的な更新再開
+
+実機のv0.3.1-devログで、通常のDisk interface経由からSony `0xFC/0x03` がSCSI GOODで成功し、8バイト `01 00 0D 00 20 02 00 00` を取得できました。一方で `TEST UNIT READY` と `READ CAPACITY(10)` は引き続き `NOT READY / 3A00 (Medium Not Present)` です。
+
+純正Updaterの `SendFWUpdateCommand` を再解析すると、通常の更新シーケンスは概ね次の順序です。
+
+1. 公式UPGをWalkmanのドライブへ `MSFWUPGR.UPG` としてコピー
+2. Sony vendor CDB `0xFC / 0x04` を送信
+3. 本体側で更新処理を開始
+
+Issue #1では公式更新が99%付近まで進んでから失敗しているため、`MSFWUPGR.UPG` が内部に残っている可能性があります。ただし、現在はNo MediaのためPC側からそのファイルの存在・完全性を確認できません。**この点は推測であり、保証できません。**
+
+v0.4-devでは「更新再開を試す」ボタンを追加しました。ボタンは次の条件をすべて満たした場合だけ有効になります。
+
+- USB IDが `VID_054C&PID_01FB`
+- Disk interfaceがそのUSBデバイス配下にある
+- SCSI INQUIRYが `SONY / NWWM MEM AAD2`
+- TEST UNIT READYが `NOT READY / 3A00`
+- READ CAPACITY(10)が `NOT READY / 3A00`
+- Sony `FC/03` がSCSI GOOD
+- FC/03の8バイト応答がIssue #1で確認済みの `01 00 0D 00 20 02 00 00` と完全一致
+
+さらに復旧ボタンを押した直後にも同じ条件を再検証します。条件が変わっていれば `FC/04` は送信しません。
+
+実行前には警告ダイアログを表示し、既定ボタンを「いいえ」にしています。明示的に「はい」を選んだ場合だけ、純正Updaterと同じ12-byte CDB `FC 00 04 00 00 00 00 00 00 00 00 00` をデータ転送なしで1回だけ送ります。
+
+**重要:** v0.4-devは一般的なNW-E405修復ツールではありません。現時点ではIssue #1の「Ver.1.x→2.0更新が99%付近で失敗し、MEMORY ERROR / No Mediaになった個体」を対象にした実験的な復旧再開モードです。内部に残る更新ファイルが不完全な場合、状態が悪化する可能性があります。
+
+FC/04が成功しても追加の書き込みコマンドを自動実行しません。状態が落ち着いた後に再度「診断する」を実行し、新しいログで結果を確認します。
 
 ## v0.3.1-devで修正した点
 
@@ -163,6 +194,7 @@ chkdsk /f
 - [x] Windows 7対応ネイティブGUI v0.2.1-dev
 - [x] Windows NT系 scsipath0..25 読み取り診断 v0.3-dev
 - [x] 純正Updater互換パラメータ・scsipathマッピング診断 v0.3.1-dev
+- [x] Issue #1専用のFC/04更新再開ゲート v0.4-dev
 - [ ] 故障実機からGUI版ログ収集
 - [ ] SONYSPTI / scsipath経路への対応
 - [ ] Sony vendor command応答の詳細解析
@@ -192,4 +224,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.3.1-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
+**v0.4-dev is a native Windows 7 GUI diagnostic/recovery-resume executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
