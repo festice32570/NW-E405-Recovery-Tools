@@ -1,33 +1,31 @@
-name: NW-E405 Recovery Report
-description: Report a NW-E405 firmware-update failure / MEMORY ERROR / No Media case
+name: NW-E405 復旧レポート
+description: MEMORY ERROR / No Media / ファームウェア更新失敗の診断結果を報告します
 title: "[NW-E405] "
-labels:
-  - recovery-report
 body:
   - type: markdown
     attributes:
       value: |
         ## NW-E405 Recovery Report
 
-        Thank you for helping test the recovery tool.
+        ご協力ありがとうございます。
 
-        This project is still under development. The current diagnostic build is read-only and does not format the player or write firmware.
+        このプロジェクトは現在開発中です。現在公開している診断版は読み取り専用で、フォーマットやファームウェア書き込みは行いません。
 
-        **Before submitting:** please do not run Windows Format, Disk Management initialization, `diskpart clean`, or `chkdsk /f` on the Walkman.
+        **報告前に、故障したWalkmanへWindowsのフォーマット、ディスクの初期化、diskpart clean、chkdsk /f等を実行しないでください。**
 
   - type: input
     id: name
     attributes:
-      label: Name / Handle
-      description: A nickname or handle is fine. Real name is not required.
-      placeholder: Example: festice32570
+      label: お名前 / ハンドルネーム
+      description: 本名でなくて大丈夫です。普段使っている名前を入力してください。
+      placeholder: 例：○○
     validations:
       required: true
 
   - type: input
     id: model
     attributes:
-      label: Walkman model
+      label: Walkmanの機種
       value: NW-E405
     validations:
       required: true
@@ -35,58 +33,58 @@ body:
   - type: input
     id: os
     attributes:
-      label: Windows version
-      placeholder: Example: Windows 7 64-bit
+      label: 使用しているWindows
+      placeholder: 例：Windows 7 64-bit
     validations:
       required: true
 
   - type: textarea
     id: before
     attributes:
-      label: What happened before the failure?
-      description: Please describe the firmware update attempt and the free-space situation if known.
+      label: 故障する直前の状況
+      description: ファームウェア更新時の状況や、内蔵メモリの空き容量について分かる範囲で教えてください。
       placeholder: |
-        Example:
-        I tried to update the firmware while the internal memory had very little free space.
-        The update failed part-way through.
+        例：
+        内蔵メモリの空き容量が少ない状態でファームウェア更新を実行しました。
+        更新途中で失敗しました。
     validations:
       required: true
 
   - type: checkboxes
     id: symptoms
     attributes:
-      label: Current symptoms
-      description: Check everything that applies.
+      label: 現在の症状
+      description: 当てはまるものを選んでください。
       options:
-        - label: The Walkman displays "MEMORY ERROR"
-        - label: Windows detects a removable disk
-        - label: Opening the removable disk says "Please insert a disk"
-        - label: DiskPart shows No Media / 0 B
-        - label: Service mode cannot be entered
-        - label: The original Sony firmware updater no longer completes
+        - label: 本体に「MEMORY ERROR」と表示される
+        - label: Windowsではリムーバブルディスクとして認識される
+        - label: 開くと「ディスクを挿入してください」と表示される
+        - label: DiskPartでは No Media / 0 B と表示される
+        - label: サービスモードに入れない
+        - label: Sony純正ファームウェアアップデータでは復旧できない
 
   - type: textarea
     id: extra
     attributes:
-      label: Additional details
-      description: Anything else you noticed, including exact error messages.
-      placeholder: Add any other information here.
+      label: その他の情報
+      description: エラー表示や気付いたことがあれば書いてください。
+      placeholder: 分かる範囲で大丈夫です。
 
   - type: textarea
     id: log
     attributes:
-      label: Diagnostic log
-      description: Drag and drop the NW-E405_diag_YYYYMMDD_HHMMSS.txt file here, or paste its contents.
-      placeholder: Drag and drop the diagnostic TXT file here.
+      label: 診断ログ
+      description: NW-E405-Recovery-Tool.exeで作成された NW-E405_diag_YYYYMMDD_HHMMSS.txt を、この欄へドラッグ＆ドロップしてください。内容を直接貼り付けても構いません。
+      placeholder: ここへ診断TXTファイルをドラッグ＆ドロップしてください。
     validations:
       required: true
 
   - type: checkboxes
     id: confirmation
     attributes:
-      label: Confirmation
+      label: 確認
       options:
-        - label: I did not format, initialize, clean, or repair the Walkman's storage after the failure.
-        - label: I understand this project is still experimental and under development.
-    validations:
-      required: true
+        - label: 故障後、Walkmanをフォーマット・初期化・diskpart clean等していません
+          required: true
+        - label: このツールが現在開発中の実験的なものだと理解しています
+          required: true
