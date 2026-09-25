@@ -2,6 +2,9 @@
 
 > 🚧 **Work in progress / 開発中**
 >
+> **診断ログの報告はこちら:**  
+> https://github.com/festice32570/NW-E405-Recovery-Tools/issues/new?template=nw-e405-recovery-report.yml
+>
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
 ## GUI版 v0.2.1-dev
