@@ -9,14 +9,18 @@
 #include <wchar.h>
 #include <string.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#include <wincrypt.h>
+#include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.4-dev"
+#define APP_TITLE L"NW-E405 Recovery Lab v0.5-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
 #define ID_FOLDER 1003
 #define ID_GITHUB 1004
-#define ID_RECOVER 1005
+#define ID_BACKUP 1005
+#define ID_VERIFY_FW 1006
 #define ID_OUTPUT 1101
 #define ID_STATUS 1102
 
@@ -24,10 +28,20 @@ static HWND g_hwnd = NULL;
 static HWND g_output = NULL;
 static HWND g_status = NULL;
 static HWND g_scan = NULL;
-static HWND g_recover = NULL;
-static BOOL g_recoveryEligible = FALSE;
-
-static BOOL SaveLog(void);
+static HWND g_backup = NULL;
+static HANDLE g_liveLog = INVALID_HANDLE_VALUE;
+static HANDLE g_jsonLog = INVALID_HANDLE_VALUE;
+static WCHAR g_jsonLogPath[MAX_PATH] = {0};
+static WCHAR g_sessionStem[96] = {0};
+static WCHAR g_backupDevicePath[1024] = {0};
+static uint64_t g_backupCapacityBytes = 0;
+static DWORD g_backupBlockSize = 0;
+static BOOL g_mediaBackupAvailable = FALSE;
+static BYTE g_metaInquiry[96]; static DWORD g_metaInquiryLen = 0;
+static BYTE g_metaFc03[8]; static DWORD g_metaFc03Len = 0;
+static BYTE g_metaFc05[16]; static DWORD g_metaFc05Len = 0;
+static BYTE g_metaFc09[24]; static DWORD g_metaFc09Len = 0;
+static LONG g_cdbSequence = 0;
 static WCHAR g_logPath[MAX_PATH] = {0};
 static WCHAR g_exeDir[MAX_PATH] = {0};
 static BOOL g_exactUsbPresent = FALSE;
@@ -46,7 +60,17 @@ typedef struct {
     BYTE data[128];
     DWORD dataLen;
     BYTE sense[32];
+    BYTE cdb[16];
+    BYTE cdbLen;
+    BYTE targetId;
+    DWORD requestedDataLen;
+    DWORD elapsedMs;
 } ScsiResult;
+
+static void TraceCdbJson(const ScsiResult *r);
+static BOOL StartSessionLogs(void);
+static void CloseSessionLogs(void);
+static void SaveMetadataBackup(void);
 
 static void PumpMessages(void) {
     MSG msg;
@@ -65,6 +89,20 @@ static void Append(const WCHAR *text) {
     PumpMessages();
 }
 
+static void WriteUtf8Line(HANDLE h, const WCHAR *line) {
+    if (h == INVALID_HANDLE_VALUE || !line) return;
+    int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, NULL, 0, NULL, NULL);
+    if (n <= 1) return;
+    char *u8 = (char*)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)n + 2);
+    if (!u8) return;
+    WideCharToMultiByte(CP_UTF8, 0, line, -1, u8, n, NULL, NULL);
+    u8[n-1] = '\r'; u8[n] = '\n';
+    DWORD wr = 0;
+    WriteFile(h, u8, (DWORD)n + 1, &wr, NULL);
+    FlushFileBuffers(h);
+    HeapFree(GetProcessHeap(), 0, u8);
+}
+
 static void LogF(const WCHAR *fmt, ...) {
     WCHAR buf[2048];
     va_list ap;
@@ -74,6 +112,30 @@ static void LogF(const WCHAR *fmt, ...) {
     buf[2047] = 0;
     Append(buf);
     Append(L"\r\n");
+    WriteUtf8Line(g_liveLog, buf);
+}
+
+static void CloseSessionLogs(void) {
+    if (g_liveLog != INVALID_HANDLE_VALUE) { FlushFileBuffers(g_liveLog); CloseHandle(g_liveLog); g_liveLog = INVALID_HANDLE_VALUE; }
+    if (g_jsonLog != INVALID_HANDLE_VALUE) { FlushFileBuffers(g_jsonLog); CloseHandle(g_jsonLog); g_jsonLog = INVALID_HANDLE_VALUE; }
+}
+
+static BOOL StartSessionLogs(void) {
+    CloseSessionLogs();
+    SYSTEMTIME st; GetLocalTime(&st);
+    _snwprintf(g_sessionStem, 95, L"%04u%02u%02u_%02u%02u%02u", st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+    g_sessionStem[95] = 0;
+    _snwprintf(g_logPath, MAX_PATH-1, L"%s\\NW-E405_diag_%s.txt", g_exeDir, g_sessionStem);
+    _snwprintf(g_jsonLogPath, MAX_PATH-1, L"%s\\NW-E405_trace_%s.jsonl", g_exeDir, g_sessionStem);
+    g_liveLog = CreateFileW(g_logPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+    g_jsonLog = CreateFileW(g_jsonLogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+    if (g_liveLog != INVALID_HANDLE_VALUE) {
+        DWORD wr=0; BYTE bom[3]={0xEF,0xBB,0xBF}; WriteFile(g_liveLog,bom,3,&wr,NULL); FlushFileBuffers(g_liveLog);
+    }
+    g_cdbSequence = 0;
+    return g_liveLog != INVALID_HANDLE_VALUE && g_jsonLog != INVALID_HANDLE_VALUE;
 }
 
 static void SetStatus(const WCHAR *s) {
@@ -129,6 +191,8 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
     ZeroMemory(&r, sizeof(r));
     if (h == INVALID_HANDLE_VALUE) return r;
     r.opened = TRUE;
+    r.cdbLen = cdbLen; r.targetId = targetId; r.requestedDataLen = dataLen;
+    CopyMemory(r.cdb, cdb, cdbLen > 16 ? 16 : cdbLen);
 
     BYTE *data = NULL;
     if (dataLen > sizeof(r.data)) dataLen = sizeof(r.data);
@@ -156,8 +220,10 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
     CopyMemory(pkt.sptd.Cdb, cdb, cdbLen);
 
     DWORD ret = 0;
+    DWORD started = GetTickCount();
     BOOL ok = DeviceIoControl(h, IOCTL_SCSI_PASS_THROUGH_DIRECT,
         &pkt, sizeof(pkt), &pkt, sizeof(pkt), &ret, NULL);
+    r.elapsedMs = GetTickCount() - started;
     r.ioctlOk = ok;
     r.winErr = ok ? ERROR_SUCCESS : GetLastError();
     r.scsiStatus = pkt.sptd.ScsiStatus;
@@ -167,6 +233,7 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
         r.dataLen = dataLen;
     }
     if (data) HeapFree(GetProcessHeap(), 0, data);
+    TraceCdbJson(&r);
     return r;
 }
 
@@ -174,23 +241,32 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
     return SendCdbEx(h, cdb, cdbLen, dataLen, 0);
 }
 
-
-static BOOL IsNoMediaResult(const ScsiResult *r) {
-    return r && r->ioctlOk && r->scsiStatus == 0x02 &&
-           ((r->sense[2] & 0x0F) == 0x02) &&
-           r->sense[12] == 0x3A && r->sense[13] == 0x00;
-}
-
-static BOOL IsIssue1FwInfo(const ScsiResult *r) {
-    static const BYTE expected[8] = {0x01,0x00,0x0D,0x00,0x20,0x02,0x00,0x00};
-    return r && r->ioctlOk && r->scsiStatus == 0x00 && r->dataLen >= 8 &&
-           memcmp(r->data, expected, sizeof(expected)) == 0;
+static void TraceCdbJson(const ScsiResult *r) {
+    if (!r || g_jsonLog == INVALID_HANDLE_VALUE) return;
+    WCHAR cdbHex[96]={0}, senseHex[160]={0}, dataHex[600]={0};
+    BytesToHex(r->cdb, r->cdbLen, cdbHex, 96);
+    BytesToHex(r->sense, 18, senseHex, 160);
+    BytesToHex(r->data, r->dataLen > 128 ? 128 : r->dataLen, dataHex, 600);
+    SYSTEMTIME st; GetLocalTime(&st);
+    char line[4096];
+    char cdbA[192]={0}, senseA[320]={0}, dataA[1200]={0};
+    WideCharToMultiByte(CP_UTF8,0,cdbHex,-1,cdbA,sizeof(cdbA),NULL,NULL);
+    WideCharToMultiByte(CP_UTF8,0,senseHex,-1,senseA,sizeof(senseA),NULL,NULL);
+    WideCharToMultiByte(CP_UTF8,0,dataHex,-1,dataA,sizeof(dataA),NULL,NULL);
+    LONG seq=InterlockedIncrement(&g_cdbSequence);
+    int n=_snprintf(line,sizeof(line)-1,
+        "{\"seq\":%ld,\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu,\"ioctl_ok\":%s,\"win32\":%lu,\"scsi_status\":%u,\"sense\":\"%s\",\"data\":\"%s\",\"elapsed_ms\":%lu}\r\n",
+        seq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
+        r->targetId,cdbA,r->requestedDataLen?"IN":"NONE",r->requestedDataLen,r->ioctlOk?"true":"false",r->winErr,r->scsiStatus,senseA,dataA,r->elapsedMs);
+    if (n>0) { DWORD wr=0; WriteFile(g_jsonLog,line,(DWORD)n,&wr,NULL); FlushFileBuffers(g_jsonLog); }
 }
 
 static void ShowScsiResult(const WCHAR *name, const ScsiResult *r) {
     WCHAR hex[512];
     BytesToHex(r->sense, 18, hex, 512);
     LogF(L"--- %s ---", name);
+    WCHAR cdbhex[96]; BytesToHex(r->cdb, r->cdbLen, cdbhex, 96);
+    LogF(L"CDB: %s  TargetId=%u  DataLen=%lu  Elapsed=%lu ms", cdbhex, r->targetId, r->requestedDataLen, r->elapsedMs);
     LogF(L"IOCTL=%s  SCSI Status=0x%02X  Win32=%lu",
         r->ioctlOk ? L"OK" : L"FAIL", r->scsiStatus, r->winErr);
     LogF(L"Sense: %s  ASC/ASCQ=%02X/%02X",
@@ -210,6 +286,27 @@ static BOOL ContainsI(const WCHAR *hay, const WCHAR *needle) {
         if (_wcsnicmp(p, needle, n) == 0) return TRUE;
     }
     return FALSE;
+}
+
+static void LogHostEnvironment(void) {
+    SYSTEM_INFO si; ZeroMemory(&si,sizeof(si)); GetNativeSystemInfo(&si);
+    BOOL wow=FALSE; IsWow64Process(GetCurrentProcess(), &wow);
+    const WCHAR *arch=L"unknown";
+    if (si.wProcessorArchitecture==PROCESSOR_ARCHITECTURE_AMD64) arch=L"x64";
+    else if (si.wProcessorArchitecture==PROCESSOR_ARCHITECTURE_INTEL) arch=L"x86";
+    else if (si.wProcessorArchitecture==PROCESSOR_ARCHITECTURE_ARM64) arch=L"ARM64";
+    LogF(L"Host architecture: %s  Tool process: x86%s", arch, wow?L" (WoW64)":L"");
+
+    typedef LONG (WINAPI *RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll=GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn fn=ntdll?(RtlGetVersionFn)GetProcAddress(ntdll,"RtlGetVersion"):NULL;
+    RTL_OSVERSIONINFOW vi; ZeroMemory(&vi,sizeof(vi)); vi.dwOSVersionInfoSize=sizeof(vi);
+    if (fn && fn(&vi)==0) LogF(L"Windows version: %lu.%lu build %lu",vi.dwMajorVersion,vi.dwMinorVersion,vi.dwBuildNumber);
+    BOOL isAdmin=FALSE; SID_IDENTIFIER_AUTHORITY ntAuth=SECURITY_NT_AUTHORITY; PSID adminSid=NULL;
+    if(AllocateAndInitializeSid(&ntAuth,2,SECURITY_BUILTIN_DOMAIN_RID,DOMAIN_ALIAS_RID_ADMINS,0,0,0,0,0,0,&adminSid)){
+        CheckTokenMembership(NULL,adminSid,&isAdmin); FreeSid(adminSid);
+    }
+    LogF(L"Administrator token membership: %s",isAdmin?L"YES":L"NO");
 }
 
 static void GetDevProp(HDEVINFO set, SP_DEVINFO_DATA *dev, DWORD prop, WCHAR *out, DWORD cch) {
@@ -531,6 +628,7 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
 
     LogF(L"  Expected SCSI identity found.");
     LogF(L"  USB parent mapping to VID_054C&PID_01FB: %s", exactMapped ? L"YES" : L"NO");
+    if (exactMapped) { g_metaInquiryLen = inq.dataLen > 96 ? 96 : inq.dataLen; CopyMemory(g_metaInquiry, inq.data, g_metaInquiryLen); }
     LogF(L"");
 
     ShowScsiResult(L"SCSI INQUIRY", &inq);
@@ -557,6 +655,10 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
                         ((uint32_t)cap.data[6] << 8) | cap.data[7];
         uint64_t bytes = ((uint64_t)last + 1ULL) * blen;
         LogF(L"Capacity: %I64u bytes  BlockSize=%lu", bytes, blen);
+        if (exactMapped && blen >= 256 && blen <= 4096 && bytes > 0 && bytes <= (2ULL*1024*1024*1024)) {
+            lstrcpynW(g_backupDevicePath, path, 1024);
+            g_backupCapacityBytes = bytes; g_backupBlockSize = blen; g_mediaBackupAvailable = TRUE;
+        }
         LogF(L"");
     }
 
@@ -570,16 +672,32 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
         ShowScsiResult(L"SONY 0xFC/0x03 (read-only vendor query)", &sonyInfo);
 
         if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0) {
-            LogF(L"RESULT: Sony vendor-command processor responded. Stage-2 software recovery may be possible.");
-            if (IsNoMediaResult(&tur) && IsNoMediaResult(&cap) && IsIssue1FwInfo(&sonyInfo)) {
-                g_recoveryEligible = TRUE;
-                LogF(L"RECOVERY PREFLIGHT: MATCH — Issue #1 resume conditions satisfied.");
-                LogF(L"Known FW info: 01 00 0D 00 20 02 00 00");
-            } else {
-                LogF(L"RECOVERY PREFLIGHT: NOT MATCHED — FC/04 remains locked.");
-            }
+            LogF(L"RESULT: Sony vendor-command processor responded. Read-only recovery research can continue.");
+            g_metaFc03Len = sonyInfo.dataLen > 8 ? 8 : sonyInfo.dataLen;
+            CopyMemory(g_metaFc03, sonyInfo.data, g_metaFc03Len);
         } else {
             LogF(L"RESULT: Sony vendor read command did not complete successfully.");
+        }
+
+        // Original GetDeviceId path for ClassifyType=3: FC/05, allocation 16.
+        ZeroMemory(cdb, sizeof(cdb));
+        cdb[0] = 0xFC; cdb[2] = 0x05; cdb[9] = 0x10;
+        ScsiResult devId = SendCdb(h, cdb, 12, 16);
+        ShowScsiResult(L"SONY 0xFC/0x05 GetDeviceId (read-only)", &devId);
+        if (devId.ioctlOk && devId.scsiStatus == 0) {
+            g_metaFc05Len = devId.dataLen > 16 ? 16 : devId.dataLen;
+            CopyMemory(g_metaFc05, devId.data, g_metaFc05Len);
+        }
+
+        // Original GetProductInfo vendor-read shape. The INI signature is ASCII "roga".
+        ZeroMemory(cdb, sizeof(cdb));
+        cdb[0] = 0xFC; cdb[2] = 0x09;
+        cdb[3] = 'r'; cdb[4] = 'o'; cdb[5] = 'g'; cdb[6] = 'a';
+        ScsiResult prod = SendCdb(h, cdb, 12, 24);
+        ShowScsiResult(L"SONY 0xFC/0x09 GetProductInfo probe (read-only)", &prod);
+        if (prod.ioctlOk && prod.scsiStatus == 0) {
+            g_metaFc09Len = prod.dataLen > 24 ? 24 : prod.dataLen;
+            CopyMemory(g_metaFc09, prod.data, g_metaFc09Len);
         }
     } else {
         LogF(L"SAFETY: Sony vendor command skipped because this disk interface was not");
@@ -589,162 +707,6 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
     LogF(L"");
     CloseHandle(h);
     return TRUE;
-}
-
-
-static HANDLE OpenIssue1RecoveryTarget(void) {
-    HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (set == INVALID_HANDLE_VALUE) {
-        LogF(L"RECOVERY: Disk enumeration failed: %lu", GetLastError());
-        return INVALID_HANDLE_VALUE;
-    }
-
-    HANDLE result = INVALID_HANDLE_VALUE;
-    for (DWORD i = 0; result == INVALID_HANDLE_VALUE; ++i) {
-        SP_DEVICE_INTERFACE_DATA ifc;
-        ZeroMemory(&ifc, sizeof(ifc));
-        ifc.cbSize = sizeof(ifc);
-        if (!SetupDiEnumDeviceInterfaces(set, NULL, &GUID_DEVINTERFACE_DISK, i, &ifc)) {
-            if (GetLastError() == ERROR_NO_MORE_ITEMS) break;
-            continue;
-        }
-
-        DWORD need = 0;
-        SetupDiGetDeviceInterfaceDetailW(set, &ifc, NULL, 0, &need, NULL);
-        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail =
-            (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, need);
-        if (!detail) continue;
-        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-
-        SP_DEVINFO_DATA dev;
-        ZeroMemory(&dev, sizeof(dev));
-        dev.cbSize = sizeof(dev);
-
-        if (SetupDiGetDeviceInterfaceDetailW(set, &ifc, detail, need, NULL, &dev) &&
-            DevNodeHasExactNwE405Ancestor(dev.DevInst)) {
-            DWORD err = 0;
-            HANDLE h = OpenDeviceRW(detail->DevicePath, &err);
-            if (h != INVALID_HANDLE_VALUE) {
-                BYTE cdb[16] = {0};
-                cdb[0] = 0x12; cdb[4] = 96;
-                ScsiResult inq = SendCdb(h, cdb, 6, 96);
-                WCHAR vendor[32] = {0}, product[64] = {0};
-                if (inq.ioctlOk && inq.scsiStatus == 0 && inq.dataLen >= 36) {
-                    BytesToAscii(inq.data, 8, 8, vendor, 32);
-                    BytesToAscii(inq.data, 16, 16, product, 64);
-                }
-
-                BOOL identity = ContainsI(vendor, L"SONY") && ContainsI(product, L"NWWM MEM AAD2");
-                if (identity) {
-                    ZeroMemory(cdb, sizeof(cdb)); cdb[0] = 0x00;
-                    ScsiResult tur = SendCdb(h, cdb, 6, 0);
-                    ZeroMemory(cdb, sizeof(cdb)); cdb[0] = 0x25;
-                    ScsiResult cap = SendCdb(h, cdb, 10, 8);
-                    ZeroMemory(cdb, sizeof(cdb));
-                    cdb[0] = 0xFC; cdb[2] = 0x03; cdb[8] = 0x08;
-                    ScsiResult fw = SendCdb(h, cdb, 12, 8);
-
-                    LogF(L"RECOVERY re-check: identity=%s TUR-3A00=%s CAP-3A00=%s FW-info=%s",
-                        identity ? L"YES" : L"NO",
-                        IsNoMediaResult(&tur) ? L"YES" : L"NO",
-                        IsNoMediaResult(&cap) ? L"YES" : L"NO",
-                        IsIssue1FwInfo(&fw) ? L"MATCH" : L"NO");
-
-                    if (IsNoMediaResult(&tur) && IsNoMediaResult(&cap) && IsIssue1FwInfo(&fw)) {
-                        result = h;
-                    } else {
-                        CloseHandle(h);
-                    }
-                } else {
-                    CloseHandle(h);
-                }
-            }
-        }
-        HeapFree(GetProcessHeap(), 0, detail);
-    }
-    SetupDiDestroyDeviceInfoList(set);
-    return result;
-}
-
-static void RunRecovery(void) {
-    if (!g_recoveryEligible) {
-        MessageBoxW(g_hwnd,
-            L"復旧条件が確認できていません。先に『NW-E405を診断する』を実行してください。",
-            L"Recovery locked", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    int ans = MessageBoxW(g_hwnd,
-        L"これはIssue #1の個体専用の実験的な更新再開処理です。\n\n"
-        L"前提:\n"
-        L"・NW-E405 (VID 054C / PID 01FB)\n"
-        L"・Ver.1.x → 2.0更新が99%付近で失敗\n"
-        L"・MEMORY ERROR / No Media\n"
-        L"・FC/03の8バイト応答が既知値と一致\n\n"
-        L"続行すると、Sony純正Updaterが使う更新開始コマンド FC/04 を送信します。\n"
-        L"内部に残っているMSFWUPGR.UPGが不完全な場合、状態が悪化する可能性があります。\n\n"
-        L"この個体で更新再開を試しますか？",
-        L"NW-E405 Experimental Recovery", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-    if (ans != IDYES) return;
-
-    g_recoveryEligible = FALSE;
-    EnableWindow(g_scan, FALSE);
-    EnableWindow(g_recover, FALSE);
-    SetStatus(L"復旧前チェック中... USBを抜かないでください");
-    LogF(L"");
-    LogF(L"=== EXPERIMENTAL RECOVERY / ISSUE #1 ===");
-    LogF(L"Re-validating device state immediately before FC/04...");
-
-    BOOL usb = ScanSonyUsbDevices();
-    if (!usb) {
-        LogF(L"ABORT: exact USB VID/PID is no longer present.");
-        SetStatus(L"復旧中止 — NW-E405を確認できません");
-        EnableWindow(g_scan, TRUE);
-        SaveLog();
-        return;
-    }
-
-    HANDLE h = OpenIssue1RecoveryTarget();
-    if (h == INVALID_HANDLE_VALUE) {
-        LogF(L"ABORT: recovery preflight no longer matches. FC/04 was NOT sent.");
-        SetStatus(L"復旧中止 — 条件が一致しません（FC/04未送信）");
-        EnableWindow(g_scan, TRUE);
-        SaveLog();
-        return;
-    }
-
-    LogF(L"All recovery gates passed.");
-    LogF(L"Sending original Sony update-start CDB: FC 00 04 00 00 00 00 00 00 00 00 00");
-    SetStatus(L"FC/04送信中... USBを抜かないでください");
-
-    BYTE cdb[16] = {0};
-    cdb[0] = 0xFC;
-    cdb[2] = 0x04;
-    ScsiResult r = SendCdb(h, cdb, 12, 0);
-    ShowScsiResult(L"SONY 0xFC/0x04 UPDATE START", &r);
-    CloseHandle(h);
-
-    if (r.ioctlOk && r.scsiStatus == 0x00) {
-        LogF(L"RECOVERY: FC/04 was accepted with SCSI GOOD status.");
-        LogF(L"Do NOT disconnect the Walkman while it processes/reboots.");
-        LogF(L"After the device settles, run Diagnostics again and attach the new log to Issue #1.");
-        SetStatus(L"FC/04 accepted — 本体処理中はUSBを抜かないでください");
-        MessageBoxW(g_hwnd,
-            L"FC/04はSCSI GOODで受理されました。\n\n本体が処理・再起動している間はUSBを抜かないでください。\n"
-            L"状態が落ち着いたら、もう一度『NW-E405を診断する』を実行してください。",
-            L"Recovery command accepted", MB_OK | MB_ICONINFORMATION);
-    } else {
-        LogF(L"RECOVERY: FC/04 was NOT accepted successfully.");
-        LogF(L"No further write/update command will be attempted automatically.");
-        SetStatus(L"FC/04失敗 — 追加処理は実行していません");
-        MessageBoxW(g_hwnd,
-            L"FC/04は正常に受理されませんでした。追加の更新命令は送っていません。\nログをIssue #1へ添付してください。",
-            L"Recovery command failed", MB_OK | MB_ICONERROR);
-    }
-
-    SaveLog();
-    EnableWindow(g_scan, TRUE);
 }
 
 static int EnumerateDisks(void) {
@@ -791,50 +753,128 @@ static int EnumerateDisks(void) {
     return sonyCount;
 }
 
-static BOOL SaveLog(void) {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    _snwprintf(g_logPath, MAX_PATH - 1, L"%s\\NW-E405_diag_%04u%02u%02u_%02u%02u%02u.txt",
-        g_exeDir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+static void WriteTlv(HANDLE h, DWORD tag, const BYTE *data, DWORD len) {
+    DWORD wr=0; WriteFile(h,&tag,4,&wr,NULL); WriteFile(h,&len,4,&wr,NULL);
+    if (len) WriteFile(h,data,len,&wr,NULL);
+}
 
-    int len = GetWindowTextLengthW(g_output);
-    WCHAR *w = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (len + 2) * sizeof(WCHAR));
-    if (!w) return FALSE;
-    GetWindowTextW(g_output, w, len + 1);
+static void SaveMetadataBackup(void) {
+    if (!g_sessionStem[0]) return;
+    WCHAR path[MAX_PATH];
+    _snwprintf(path,MAX_PATH-1,L"%s\\NW-E405_metadata_%s.bin",g_exeDir,g_sessionStem);
+    HANDLE h=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
+    if (h==INVALID_HANDLE_VALUE) { LogF(L"Metadata backup: could not create file (%lu)",GetLastError()); return; }
+    DWORD wr=0; const char magic[]="NWE405META1"; WriteFile(h,magic,sizeof(magic),&wr,NULL);
+    WriteTlv(h,1,g_metaInquiry,g_metaInquiryLen);
+    WriteTlv(h,3,g_metaFc03,g_metaFc03Len);
+    WriteTlv(h,5,g_metaFc05,g_metaFc05Len);
+    WriteTlv(h,9,g_metaFc09,g_metaFc09Len);
+    FlushFileBuffers(h); CloseHandle(h);
+    LogF(L"Metadata backup saved: %s",path);
+    LogF(L"IMPORTANT: this is NOT a NOR/NAND firmware image backup; it stores read-only device metadata/responses.");
+}
 
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
-    char *u8 = (char*)HeapAlloc(GetProcessHeap(), 0, n);
-    if (!u8) { HeapFree(GetProcessHeap(), 0, w); return FALSE; }
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, u8, n, NULL, NULL);
+static BOOL Read10Chunk(HANDLE h, DWORD lba, WORD blocks, BYTE *buf, DWORD bytes, ScsiResult *summary) {
+    SPTDWB pkt; ZeroMemory(&pkt,sizeof(pkt));
+    pkt.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT); pkt.sptd.PathId=0; pkt.sptd.TargetId=0; pkt.sptd.Lun=0;
+    pkt.sptd.CdbLength=10; pkt.sptd.SenseInfoLength=18; pkt.sptd.DataIn=SCSI_IOCTL_DATA_IN;
+    pkt.sptd.DataTransferLength=bytes; pkt.sptd.TimeOutValue=15; pkt.sptd.DataBuffer=buf;
+    pkt.sptd.SenseInfoOffset=offsetof(SPTDWB,sense);
+    BYTE *cdb=pkt.sptd.Cdb; cdb[0]=0x28;
+    cdb[2]=(BYTE)(lba>>24); cdb[3]=(BYTE)(lba>>16); cdb[4]=(BYTE)(lba>>8); cdb[5]=(BYTE)lba;
+    cdb[7]=(BYTE)(blocks>>8); cdb[8]=(BYTE)blocks;
+    DWORD ret=0,started=GetTickCount();
+    BOOL ok=DeviceIoControl(h,IOCTL_SCSI_PASS_THROUGH_DIRECT,&pkt,sizeof(pkt),&pkt,sizeof(pkt),&ret,NULL);
+    if (summary) { ZeroMemory(summary,sizeof(*summary)); summary->opened=TRUE; summary->ioctlOk=ok; summary->winErr=ok?0:GetLastError(); summary->scsiStatus=pkt.sptd.ScsiStatus; summary->elapsedMs=GetTickCount()-started; summary->cdbLen=10; summary->targetId=0; summary->requestedDataLen=bytes; CopyMemory(summary->cdb,cdb,10); CopyMemory(summary->sense,pkt.sense,18); }
+    return ok && pkt.sptd.ScsiStatus==0;
+}
 
-    HANDLE f = CreateFileW(g_logPath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    BOOL ok = FALSE;
-    if (f != INVALID_HANDLE_VALUE) {
-        DWORD wr = 0;
-        BYTE bom[3] = {0xEF,0xBB,0xBF};
-        WriteFile(f, bom, 3, &wr, NULL);
-        WriteFile(f, u8, (DWORD)(n - 1), &wr, NULL);
-        CloseHandle(f);
-        ok = TRUE;
+static void BackupLogicalMedia(void) {
+    if (!g_mediaBackupAvailable || !g_backupDevicePath[0]) {
+        MessageBoxW(g_hwnd,L"この個体はREAD CAPACITYが通っていないため、論理ストレージをバックアップできません。\n\n現在のNo Media状態ではNANDの通常読み出し経路がありません。",L"Backup unavailable",MB_OK|MB_ICONINFORMATION);
+        return;
     }
-    HeapFree(GetProcessHeap(), 0, u8);
-    HeapFree(GetProcessHeap(), 0, w);
+    WCHAR partial[MAX_PATH],final[MAX_PATH];
+    _snwprintf(partial,MAX_PATH-1,L"%s\\NW-E405_storage_%s.img.partial",g_exeDir,g_sessionStem);
+    _snwprintf(final,MAX_PATH-1,L"%s\\NW-E405_storage_%s.img",g_exeDir,g_sessionStem);
+    int ans=MessageBoxW(g_hwnd,L"内蔵ストレージをREAD(10)だけで丸ごと読み出します。\n本体への書き込みは行いません。開始しますか？",L"Logical storage backup",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
+    if(ans!=IDYES)return;
+    HANDLE dev=OpenDeviceRW(g_backupDevicePath,NULL);
+    if(dev==INVALID_HANDLE_VALUE){LogF(L"Storage backup: device open failed %lu",GetLastError());return;}
+    HANDLE out=CreateFileW(partial,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
+    if(out==INVALID_HANDLE_VALUE){CloseHandle(dev);LogF(L"Storage backup: host output open failed %lu",GetLastError());return;}
+    const DWORD maxBytes=64*1024; BYTE *buf=(BYTE*)VirtualAlloc(NULL,maxBytes,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    if(!buf){CloseHandle(out);CloseHandle(dev);return;}
+    uint64_t totalBlocks=g_backupCapacityBytes/g_backupBlockSize,done=0; int lastPct=-1; BOOL okAll=TRUE;
+    while(done<totalBlocks){
+        DWORD remain=(DWORD)((totalBlocks-done)>0xFFFFFFFFULL?0xFFFFFFFFULL:(totalBlocks-done));
+        DWORD maxBlocks=maxBytes/g_backupBlockSize; WORD n=(WORD)((remain<maxBlocks)?remain:maxBlocks);
+        DWORD bytes=n*g_backupBlockSize; ScsiResult tr;
+        if(!Read10Chunk(dev,(DWORD)done,n,buf,bytes,&tr)){ TraceCdbJson(&tr); LogF(L"READ(10) failed at LBA %lu: status=%02X sense=%02X/%02X",(DWORD)done,tr.scsiStatus,tr.sense[12],tr.sense[13]);okAll=FALSE;break; }
+        TraceCdbJson(&tr);
+        DWORD wr=0;if(!WriteFile(out,buf,bytes,&wr,NULL)||wr!=bytes){LogF(L"Host image write failed at LBA %lu",(DWORD)done);okAll=FALSE;break;}
+        done+=n; int pct=(int)((done*100ULL)/totalBlocks); if(pct!=lastPct){lastPct=pct;SetStatus(L"論理ストレージをバックアップ中...");LogF(L"Storage backup progress: %d%%",pct);FlushFileBuffers(out);}
+        PumpMessages();
+    }
+    FlushFileBuffers(out);CloseHandle(out);CloseHandle(dev);VirtualFree(buf,0,MEM_RELEASE);
+    if(okAll&&done==totalBlocks){MoveFileExW(partial,final,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);LogF(L"Logical storage image complete: %s",final);SetStatus(L"ストレージバックアップ完了");}
+    else {LogF(L"Partial image retained for analysis: %s",partial);SetStatus(L"バックアップ途中で停止 — partialを保持しました");}
+}
+
+static BOOL SaveLog(void) {
+    BOOL ok=TRUE;
+    if(g_liveLog!=INVALID_HANDLE_VALUE) ok=FlushFileBuffers(g_liveLog)&&ok;
+    if(g_jsonLog!=INVALID_HANDLE_VALUE) ok=FlushFileBuffers(g_jsonLog)&&ok;
     return ok;
 }
 
+static void VerifyFirmwareGui(void) {
+    if (g_liveLog == INVALID_HANDLE_VALUE) StartSessionLogs();
+    OPENFILENAMEW ofn; ZeroMemory(&ofn,sizeof(ofn));
+    WCHAR path[MAX_PATH]={0};
+    ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
+    ofn.lpstrFilter=L"Sony Japanese updater (NW-E40X_V2_0J.exe)\0NW-E40X_V2_0J.exe\0All files\0*.*\0\0";
+    ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_HIDEREADONLY;
+    if(!GetOpenFileNameW(&ofn))return;
+    FirmwarePackageResult r; WCHAR err[512]={0};
+    LogF(L"");LogF(L"=== OFFICIAL FIRMWARE PACKAGE VERIFICATION ===");
+    LogF(L"Selected: %s",path);
+    if(VerifyAndExtractSonyFirmwarePackage(path,g_exeDir,&r,err,512)){
+        LogF(L"Sony updater SHA-256: %s",r.packageSha256);
+        LogF(L"UPG SHA-256: %s",r.upgSha256);
+        LogF(L"Package size=%lu  UPG size=%lu",r.packageSize,r.upgSize);
+        LogF(L"VERIFIED: exact Japanese NW-E405/E407 v2.0 package.");
+        LogF(L"Verified UPG extracted to: %s",r.extractedPath);
+        LogF(L"This operation writes only to the PC. Nothing was sent to the Walkman.");
+        MessageBoxW(g_hwnd,L"Sony日本版NW-E405/E407 v2.0アップデータと完全一致しました。\n\nUPGをPC側の verified_firmware フォルダへ抽出しました。\n本体への書き込みは行っていません。",L"Firmware verified",MB_OK|MB_ICONINFORMATION);
+    }else{
+        LogF(L"REJECTED: %s",err);
+        if(r.packageSha256[0])LogF(L"Selected file SHA-256: %s",r.packageSha256);
+        MessageBoxW(g_hwnd,err,L"Firmware rejected",MB_OK|MB_ICONERROR);
+    }
+}
+
 static void RunDiagnostics(void) {
-    g_recoveryEligible = FALSE;
     EnableWindow(g_scan, FALSE);
-    if (g_recover) EnableWindow(g_recover, FALSE);
+    if(g_backup)EnableWindow(g_backup,FALSE);
     SetWindowTextW(g_output, L"");
+    g_mediaBackupAvailable=FALSE; g_backupDevicePath[0]=0; g_backupCapacityBytes=0; g_backupBlockSize=0;
+    g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
+    if (!StartSessionLogs()) {
+        SetStatus(L"診断中止 — TXT/JSONLログを作成できません");
+        MessageBoxW(g_hwnd, L"安全ログ（TXT/JSONL）を作成できないため診断を開始しません。\n\n書き込み可能なフォルダへEXEを移して再実行してください。", L"Logging required", MB_OK | MB_ICONERROR);
+        EnableWindow(g_scan, TRUE);
+        return;
+    }
     SetStatus(L"診断中... USBを抜かないでください");
 
     LogF(L"%s", APP_TITLE);
-    LogF(L"Diagnostic scan is READ-ONLY.");
+    LogF(L"Safety mode: READ-ONLY device diagnostics / backup research. FC/04 is not present.");
+    LogHostEnvironment();
     LogF(L"");
-    LogF(L"診断ボタンはフォーマット、セクタ書込み、FW書込み、FC/04を実行しません。");
-    LogF(L"FC/04はIssue #1の既知状態と一致した後、復旧ボタンで明示確認した場合のみ送信します。");
+    LogF(L"本体へのフォーマット、セクタ書込み、FW書込み、FC/04更新開始は実行しません。");
+    LogF(L"FC/03, FC/05, FC/09 are Sony read/query commands reconstructed from the original updater DLL.");
     LogF(L"");
 
     BOOL usb = ScanSonyUsbDevices();
@@ -871,17 +911,14 @@ static void RunDiagnostics(void) {
     }
 
     LogF(L"");
-    LogF(L"診断完了。ログを開発者へ送ってください。");
-
-    if (SaveLog()) {
-        LogF(L"Log saved: %s", g_logPath);
-        SetStatus(L"診断完了 — ログを保存しました");
-    } else {
-        SetStatus(L"診断完了 — ログ保存に失敗しました（画面結果はコピーできます）");
-    }
-
+    SaveMetadataBackup();
+    LogF(L"TXT journal: %s",g_logPath);
+    LogF(L"JSONL CDB trace: %s",g_jsonLogPath);
+    LogF(L"診断完了。Issue #1へTXTとJSONLを添付してください。");
+    SaveLog();
+    if(g_mediaBackupAvailable){SetStatus(L"診断完了 — 論理ストレージのREAD(10)バックアップが可能です");EnableWindow(g_backup,TRUE);}
+    else {SetStatus(L"診断完了 — No Mediaのため論理ストレージの丸ごとバックアップは不可");EnableWindow(g_backup,TRUE);}
     EnableWindow(g_scan, TRUE);
-    if (g_recover) EnableWindow(g_recover, g_recoveryEligible);
 }
 
 static void CopyOutput(void) {
@@ -931,34 +968,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(title, WM_SETFONT, (WPARAM)fTitle, TRUE);
 
             HWND sub = CreateWindowW(L"STATIC",
-                L"開発中 / 診断後、Issue #1の条件一致時のみ実験的な更新再開が可能です。",
+                L"Recovery Lab / 本体側は読み取り専用。診断・バックアップ・純正FW検証を行います。",
                 WS_CHILD | WS_VISIBLE, 20, 48, 720, 24, hwnd, NULL, NULL, NULL);
             SendMessageW(sub, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
-            g_scan = CreateWindowW(L"BUTTON", L"NW-E405を診断する",
+            g_scan = CreateWindowW(L"BUTTON", L"診断する",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                20, 80, 170, 38, hwnd, (HMENU)ID_SCAN, NULL, NULL);
+                20, 80, 105, 38, hwnd, (HMENU)ID_SCAN, NULL, NULL);
             SendMessageW(g_scan, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
-            g_recover = CreateWindowW(L"BUTTON", L"更新再開を試す",
+            g_backup = CreateWindowW(L"BUTTON", L"ストレージ保存",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                200, 80, 150, 38, hwnd, (HMENU)ID_RECOVER, NULL, NULL);
-            SendMessageW(g_recover, WM_SETFONT, (WPARAM)fNormal, TRUE);
-            EnableWindow(g_recover, FALSE);
+                135, 80, 125, 38, hwnd, (HMENU)ID_BACKUP, NULL, NULL);
+            SendMessageW(g_backup, WM_SETFONT, (WPARAM)fNormal, TRUE);
+            EnableWindow(g_backup, FALSE);
+
+            HWND verify = CreateWindowW(L"BUTTON", L"純正FWを検証",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                270, 80, 125, 38, hwnd, (HMENU)ID_VERIFY_FW, NULL, NULL);
+            SendMessageW(verify, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND copy = CreateWindowW(L"BUTTON", L"結果をコピー",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                360, 80, 115, 38, hwnd, (HMENU)ID_COPY, NULL, NULL);
+                405, 80, 105, 38, hwnd, (HMENU)ID_COPY, NULL, NULL);
             SendMessageW(copy, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND folder = CreateWindowW(L"BUTTON", L"ログフォルダ",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                485, 80, 115, 38, hwnd, (HMENU)ID_FOLDER, NULL, NULL);
+                520, 80, 105, 38, hwnd, (HMENU)ID_FOLDER, NULL, NULL);
             SendMessageW(folder, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND github = CreateWindowW(L"BUTTON", L"GitHub",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                610, 80, 100, 38, hwnd, (HMENU)ID_GITHUB, NULL, NULL);
+                635, 80, 80, 38, hwnd, (HMENU)ID_GITHUB, NULL, NULL);
             SendMessageW(github, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             g_output = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -976,7 +1018,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND:
             switch (LOWORD(wp)) {
                 case ID_SCAN: RunDiagnostics(); return 0;
-                case ID_RECOVER: RunRecovery(); return 0;
+                case ID_BACKUP: BackupLogicalMedia(); return 0;
+                case ID_VERIFY_FW: VerifyFirmwareGui(); return 0;
                 case ID_COPY: CopyOutput(); return 0;
                 case ID_FOLDER:
                     ShellExecuteW(hwnd, L"open", g_exeDir, NULL, NULL, SW_SHOWNORMAL);
@@ -989,6 +1032,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case WM_DESTROY:
+            CloseSessionLogs();
             if (fNormal) DeleteObject(fNormal);
             if (fTitle) DeleteObject(fTitle);
             PostQuitMessage(0);

@@ -7,84 +7,97 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.4-dev
+## GUI版 v0.5-dev — Forensic / Preflight
 
-現在の推奨版は **`NW-E405-Recovery-Tool.exe`** です。
+現在の推奨開発版は **`NW-E405-Recovery-Lab.exe` v0.5-dev** です。
 
-Windows 7でそのまま起動できる32-bitネイティブWin32 GUIアプリです。64-bit Windows 7でも動作する構成で、PowerShell・Python・Linux・.NET Frameworkの追加導入は不要です。
+> **重要:** v0.5-devはまだ「強制フラッシュ版」ではありません。純正Updaterを再監査した結果、`CopyFileA` が失敗して `ERROR_DISK_FULL` になった場合でも制御が `FC/04` 更新開始ブロックへ合流する実装を確認しました。Issue #1の99%タイムアウトは、壊れた/不完全な更新状態でFC/04まで進んだ可能性があります。そのためv0.4-devのFC/04再送モードは撤回・Release削除し、v0.5-devからFC/04実行コードを完全に外しています。
 
-### 使い方
+Windows 7でも起動できる32-bitネイティブWin32 GUIです。64-bit Windows 7ではWoW64で動作します。PowerShell・Python・.NET Frameworkの追加導入は不要です。
 
-1. 故障したNW-E405をUSBハブを使わずPCへ直接接続します。
-2. Releaseから `NW-E405-Recovery-Tool.exe` をダウンロードします。
-3. EXEを起動します。UACが表示されたら許可します。
-4. **「NW-E405を診断する」** を押します。
-5. 結果が画面に表示され、同じフォルダへ次のログが保存されます。
+### v0.5-devでできること
 
-```
-NW-E405_diag_YYYYMMDD_HHMMSS.txt
-```
+1. **NW-E405を読み取り専用で診断**
+   - USB `VID_054C&PID_01FB`
+   - PnP parent mapping
+   - SCSI `INQUIRY`
+   - `TEST UNIT READY`
+   - `REQUEST SENSE`
+   - `READ CAPACITY(10)`
+   - Sony `FC/03` firmware-info read
+   - Sony `FC/05` GetDeviceId read (`ClassifyType=3`の純正経路)
+   - Sony `FC/09` GetProductInfo形状のread-only probe (`Signature=roga`)
+2. **Windows環境をログ化**
+   - OS version / build
+   - native architecture
+   - x86/WoW64
+   - administrator state
+3. **完全ログを即時保存**
+   - `NW-E405_diag_YYYYMMDD_HHMMSS.txt`
+   - `NW-E405_trace_YYYYMMDD_HHMMSS.jsonl`
+   - JSONLには送信CDB、Target ID、転送方向、要求長、Win32/SCSI status、Sense、返却データを1コマンドごとに記録し、都度flushします。
+4. **Sony公式日本版FWをSHA-256で検証**
+   - `NW-E40X_V2_0J.exe`
+     - SHA-256 `8b68cf41d193464439e8139aa593ebcf887d2dd0a2220a6135039b3ebf7a7eb7`
+   - `MSFWUPGR_NW-E40X_201J.UPG`
+     - size `2,131,380 bytes`
+     - SHA-256 `82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691`
 
-6. **「結果をコピー」** またはログファイルを使って結果を共有してください。
+一致しないファイルは復旧用ファームウェアとして扱いません。
 
-## v0.4-devで実行する処理
+5. **状態メタデータをバイナリ保存**
+   - SCSI INQUIRY
+   - FC/03 FW info
+   - FC/05 DeviceId
+   - FC/09 ProductInfo probe
+   - `NW-E405_metadata_YYYYMMDD_HHMMSS.bin`
+   - これは**NOR/NANDのFWイメージではありません**。
+6. **メディアが正常にREAD CAPACITYを返す個体のみ、論理ストレージをREAD(10)で丸ごと保存**
+   - 本体への書き込みなし
+   - 完了前は `.img.partial` として保持
+   - 成功時のみ `.img` へ確定
 
-Stage 1は意図的に **READ-ONLY** です。
-
-- USB/PnPでSony NW-E405のVID/PIDを確認
-- WindowsのDisk interfaceを列挙
-- SCSI `INQUIRY`
-- `TEST UNIT READY`
-- `REQUEST SENSE`
-- `READ CAPACITY(10)`
-- Sony独自 `0xFC / 0x03` 読み取りコマンド
-
-他のHDD/SSDへSony独自コマンドを送らないよう、標準SCSI INQUIRY等でSony/NWWM候補と判定したデバイスだけを対象にします。
-
-## この版では絶対に行わないこと
+### v0.5-devで絶対に行わないこと
 
 - Windowsフォーマット
 - パーティション操作
 - セクタ書き込み
-- UPGファイルのコピー
-- ファームウェア書き込み
-- Sony更新開始コマンド `0xFC / 0x04`
+- SCSI DATA OUT
+- 標準SCSI WRITE系CDB
+- UPGの本体コピー
+- `FC/04` update-start
+- 強制フラッシュ
 
-そのため、v0.4-devは **診断＋Issue #1専用の実験的な更新再開版** です。
+### なぜv0.4-devのFC/04再送を撤回したか
 
+純正 `FWUpdaterCom.dll` の `SendFWUpdateCommand` をバイト列まで固定して再監査しました。処理は `MSFWUPGR.UPG` を `CopyFileA` した後に `FC/04` を送りますが、**CopyFileAが失敗した場合もFC/04ブロックへ合流します**。さらに `GetLastError()==0x70 (ERROR_DISK_FULL)` を明示的に判定した後も、そのFC/04ブロックへ進みます。
 
+つまり公式が「約3 MBの空き」を要求しているのに容量不足で実行した場合、UPGコピーが正常完了していない状態でも本体側更新開始を指示し得る実装です。Issue #1の事故原因として非常に重要な候補です。
 
+純正GUI側では `SendFWUpdateCommand` 後に本体の再列挙を待ち、`Timer=6:00` を基準に進捗を計算して100%未満を最大99%に丸めます。`TimeOut` がない場合はTimerの1.5倍、つまり約9分でタイムアウトします。そのため「99%でタイムアウト」はPCからのファイルコピーが99%だったという意味ではありません。
 
+この新しい証拠により、故障個体へFC/04を再送する根拠はなくなりました。**v0.4-dev Releaseとtagは削除済み**です。
 
-## v0.4-dev: Issue #1 専用の実験的な更新再開
+### Windows 7 64-bitについて
 
-実機のv0.3.1-devログで、通常のDisk interface経由からSony `0xFC/0x03` がSCSI GOODで成功し、8バイト `01 00 0D 00 20 02 00 00` を取得できました。一方で `TEST UNIT READY` と `READ CAPACITY(10)` は引き続き `NOT READY / 3A00 (Medium Not Present)` です。
+2005年の純正Updaterの公式対象はWindows 98/Me/2000/XP世代です。Sonyの後年のWindows 7対応表にもNW-E405/E407は掲載されておらず、掲載外機種はWindows 7対応予定なしとされています。
 
-純正Updaterの `SendFWUpdateCommand` を再解析すると、通常の更新シーケンスは概ね次の順序です。
+一方、純正DLLのOS判定はWindows NT 6.xを単純拒否せず、管理者権限等に応じてSCSIバックエンドを選択します。そのためWindows 7 64-bitのWoW64上でもUpdaterが更新開始まで進めてしまうこと自体はコード上説明できます。
 
-1. 公式UPGをWalkmanのドライブへ `MSFWUPGR.UPG` としてコピー
-2. Sony vendor CDB `0xFC / 0x04` を送信
-3. 本体側で更新処理を開始
+現時点では「Windows 7 64-bitだけが故障原因」とは判断していません。むしろ純正DLLには、`CopyFileA` が `ERROR_DISK_FULL` で失敗しても `FC/04` へ進む制御フローがあり、空き容量不足は直接的な故障トリガになり得ます。Windows 7 x64は公式サポート外であり、再列挙や旧ドライバ周辺の追加リスク要因として扱います。
 
-Issue #1では公式更新が99%付近まで進んでから失敗しているため、`MSFWUPGR.UPG` が内部に残っている可能性があります。ただし、現在はNo MediaのためPC側からそのファイルの存在・完全性を確認できません。**この点は推測であり、保証できません。**
+### 本当の強制フラッシュに必要なもの
 
-v0.4-devでは「更新再開を試す」ボタンを追加しました。ボタンは次の条件をすべて満たした場合だけ有効になります。
+通常の純正更新は `MSFWUPGR.UPG` をWalkmanのドライブへコピーしてから `FC/04` を送ります。しかしIssue #1は現在 `MEDIUM NOT PRESENT` で、通常のファイルコピー経路を使えません。
 
-- USB IDが `VID_054C&PID_01FB`
-- Disk interfaceがそのUSBデバイス配下にある
-- SCSI INQUIRYが `SONY / NWWM MEM AAD2`
-- TEST UNIT READYが `NOT READY / 3A00`
-- READ CAPACITY(10)が `NOT READY / 3A00`
-- Sony `FC/03` がSCSI GOOD
-- FC/03の8バイト応答がIssue #1で確認済みの `01 00 0D 00 20 02 00 00` と完全一致
+したがって本当の強制フラッシュには次のどちらかを確立する必要があります。
 
-さらに復旧ボタンを押した直後にも同じ条件を再検証します。条件が変わっていれば `FC/04` は送信しません。
+- No Media状態でもUPG/イメージを送れるSony vendor data-transfer protocol
+- `XBOOT / TXD1 / RXD1` を使うCXR704060のROM/service boot protocol
 
-実行前には警告ダイアログを表示し、既定ボタンを「いいえ」にしています。明示的に「はい」を選んだ場合だけ、純正Updaterと同じ12-byte CDB `FC 00 04 00 00 00 00 00 00 00 00 00` をデータ転送なしで1回だけ送ります。
+後者のXBOOTがboot-mode selection inputであることは同SoCのSony資料で確認していますが、論理レベル・電圧・タイミング・UARTプロトコルはまだ未確定です。確認できるまでは短絡手順を公開しません。
 
-**重要:** v0.4-devは一般的なNW-E405修復ツールではありません。現時点ではIssue #1の「Ver.1.x→2.0更新が99%付近で失敗し、MEMORY ERROR / No Mediaになった個体」を対象にした実験的な復旧再開モードです。内部に残る更新ファイルが不完全な場合、状態が悪化する可能性があります。
-
-FC/04が成功しても追加の書き込みコマンドを自動実行しません。状態が落ち着いた後に再度「診断する」を実行し、新しいログで結果を確認します。
+詳細な解析メモは [`docs/RESEARCH.md`](docs/RESEARCH.md) にまとめています。
 
 ## v0.3.1-devで修正した点
 
@@ -194,12 +207,16 @@ chkdsk /f
 - [x] Windows 7対応ネイティブGUI v0.2.1-dev
 - [x] Windows NT系 scsipath0..25 読み取り診断 v0.3-dev
 - [x] 純正Updater互換パラメータ・scsipathマッピング診断 v0.3.1-dev
-- [x] Issue #1専用のFC/04更新再開ゲート v0.4-dev
-- [ ] 故障実機からGUI版ログ収集
+- [x] v0.4-dev FC/04再送案を解析により撤回・Release/tag削除
+- [x] v0.5-dev 即時Flushログ / FW検証 / FC03・FC05・FC09 read-only preflight / metadata backup / READ(10) backup
+- [x] 故障実機からv0.3.1ログ収集（FC03成功 / 3A00確認）
 - [ ] SONYSPTI / scsipath経路への対応
-- [ ] Sony vendor command応答の詳細解析
-- [ ] UPGパッケージ形式の解析
-- [ ] 安全な復旧シーケンスの検証
+- [x] FC03 FW info / FC05 DeviceId経路の特定
+- [x] FC09 / ProductInfo read-only probeを純正GetProductInfo形状から実装
+- [x] UPGヘッダ / モデルID / セクション表 / E40X-E50X差分解析
+- [ ] UPG高エントロピーペイロードの暗号/圧縮/署名方式解析
+- [ ] No Media状態への安全なfirmware transportの発見・検証
+- [ ] XBOOT ROM/service protocolの解析
 - [ ] 書込み/再フラッシュ機能（十分な検証後のみ）
 
 ## Source
@@ -216,7 +233,7 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 ## Disclaimer
 
-開発中の実験ツールです。v0.2-devは読み取り専用になるよう設計していますが、利用は自己責任でお願いします。今後追加する可能性のある書き込み系復旧機能は、安全性を確認できるまでデフォルト無効とします。
+開発中の実験ツールです。現在のmain/v0.5-devは読み取り専用です。書き込み系復旧機能は、No Media状態での安全なfirmware transportまたはROM/service protocolを確認し、実機検証できるまでmainへ戻しません。
 
 ---
 
@@ -224,4 +241,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.4-dev is a native Windows 7 GUI diagnostic/recovery-resume executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
+**v0.5-dev is a read-only Windows 7 forensic/preflight build. The earlier v0.4 FC/04 resume experiment was withdrawn and its release/tag deleted after a control-flow re-audit. v0.5 performs diagnostics, persistent CDB tracing, and official-firmware hash verification only.**
