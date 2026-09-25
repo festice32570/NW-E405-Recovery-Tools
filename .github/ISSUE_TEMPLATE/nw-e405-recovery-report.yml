@@ -1,0 +1,92 @@
+name: NW-E405 Recovery Report
+description: Report a NW-E405 firmware-update failure / MEMORY ERROR / No Media case
+title: "[NW-E405] "
+labels:
+  - recovery-report
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## NW-E405 Recovery Report
+
+        Thank you for helping test the recovery tool.
+
+        This project is still under development. The current diagnostic build is read-only and does not format the player or write firmware.
+
+        **Before submitting:** please do not run Windows Format, Disk Management initialization, `diskpart clean`, or `chkdsk /f` on the Walkman.
+
+  - type: input
+    id: name
+    attributes:
+      label: Name / Handle
+      description: A nickname or handle is fine. Real name is not required.
+      placeholder: Example: festice32570
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Walkman model
+      value: NW-E405
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      placeholder: Example: Windows 7 64-bit
+    validations:
+      required: true
+
+  - type: textarea
+    id: before
+    attributes:
+      label: What happened before the failure?
+      description: Please describe the firmware update attempt and the free-space situation if known.
+      placeholder: |
+        Example:
+        I tried to update the firmware while the internal memory had very little free space.
+        The update failed part-way through.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: symptoms
+    attributes:
+      label: Current symptoms
+      description: Check everything that applies.
+      options:
+        - label: The Walkman displays "MEMORY ERROR"
+        - label: Windows detects a removable disk
+        - label: Opening the removable disk says "Please insert a disk"
+        - label: DiskPart shows No Media / 0 B
+        - label: Service mode cannot be entered
+        - label: The original Sony firmware updater no longer completes
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional details
+      description: Anything else you noticed, including exact error messages.
+      placeholder: Add any other information here.
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Diagnostic log
+      description: Drag and drop the NW-E405_diag_YYYYMMDD_HHMMSS.txt file here, or paste its contents.
+      placeholder: Drag and drop the diagnostic TXT file here.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I did not format, initialize, clean, or repair the Walkman's storage after the failure.
+        - label: I understand this project is still experimental and under development.
+    validations:
+      required: true
