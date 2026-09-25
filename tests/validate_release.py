@@ -5,7 +5,7 @@ s=(root/'src/NW-E405-Recovery-Tool.c').read_text(encoding='utf-8')
 fwp=(root/'src/fw_package.c').read_text(encoding='utf-8')
 allc=s+'\n'+fwp
 checks={
- 'v0.6 lab build':'v0.6-dev' in s,
+ 'v0.6.1 lab build':'v0.6.1-dev' in s,
  'exact VID/PID':'VID_054C&PID_01FB' in s,
  'exact SCSI identity':'NWWM MEM AAD2' in s,
  'no FC04 CDB on main':re.search(r'cdb\s*\[\s*2\s*\]\s*=\s*0x04\b',s,re.I) is None,
@@ -35,6 +35,7 @@ checks={
  'FAT root UPG extractor':'FindRootUpg' in s and 'MSFWUPGRUPG' not in s and "'M','S','F','W','U','P','G','R','U','P','G'" in s,
  'raw UPG signature scan':'ScanImageForUpg' in s and 'UPGR_FMT' in s and '00100000' in s,
  'official UPG comparison hash':'82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691' in s,
+ 'recovery result classification':'PACKAGE_INTACT' in s and 'PACKAGE_MISMATCH' in s and 'PACKAGE_NOT_FOUND' in s and 'LOGICAL_MEDIA_UNREADABLE' in s,
  'rescue gate requires Issue1 state':'g_noMediaRescueAvailable' in s and 'g_issue1TurNoMedia' in s and 'g_issue1CapNoMedia' in s and 'g_issue1FwInfoMatch' in s,
 
 }

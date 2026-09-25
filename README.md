@@ -7,15 +7,15 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.6-dev — No Media Rescue / Forensic
+## GUI版 v0.6.1-dev — No Media Rescue / Forensic
 
-現在の推奨開発版は **`NW-E405-Recovery-Lab.exe` v0.6-dev** です。
+現在の推奨開発版は **`NW-E405-Recovery-Lab.exe` v0.6.1-dev** です。
 
-> **重要:** v0.6-devはまだ「強制フラッシュ版」ではありません。MSVCの例外テーブルまで含めて純正Updaterを再監査した結果、`CopyFileA` が失敗した場合は例外ハンドラで `SendFWUpdateCommand` が中止され、`FC/04` へ進まないことを確認しました。一方、純正GUIが99%待機へ入るのは `SendFWUpdateCommand` が成功した後です。Issue #1ではUPGコピーとFC/04開始までは成功し、その後の本体側更新または再起動・再列挙で失敗した可能性が高いと見ています。v0.4-devの単純なFC/04再送は、この失敗を繰り返す可能性があるため撤回したままです。
+> **重要:** v0.6.1-devはまだ「強制フラッシュ版」ではありません。MSVCの例外テーブルまで含めて純正Updaterを再監査した結果、`CopyFileA` が失敗した場合は例外ハンドラで `SendFWUpdateCommand` が中止され、`FC/04` へ進まないことを確認しました。一方、純正GUIが99%待機へ入るのは `SendFWUpdateCommand` が成功した後です。Issue #1ではUPGコピーとFC/04開始までは成功し、その後の本体側更新または再起動・再列挙で失敗した可能性が高いと見ています。v0.4-devの単純なFC/04再送は、この失敗を繰り返す可能性があるため撤回したままです。
 
 Windows 7でも起動できる32-bitネイティブWin32 GUIです。64-bit Windows 7ではWoW64で動作します。PowerShell・Python・.NET Frameworkの追加導入は不要です。
 
-### v0.6-devでできること
+### v0.6.1-devでできること
 
 1. **NW-E405を読み取り専用で診断**
    - USB `VID_054C&PID_01FB`
@@ -58,7 +58,7 @@ Windows 7でも起動できる32-bitネイティブWin32 GUIです。64-bit Wind
    - 成功時のみ `.img` へ確定
 
 
-### v0.6-dev: No Media救出
+### v0.6.1-dev: No Media救出
 
 Issue #1の実機ログと完全一致した場合だけ「No Media救出」ボタンを有効にします。
 
@@ -73,7 +73,7 @@ Issue #1の実機ログと完全一致した場合だけ「No Media救出」ボ�
 
 すべてのデバイスアクセスはDATA INまたはno-dataの読み取り/問い合わせで、`FC/04`、SCSI DATA OUT、WRITE(10/12)、WRITE BUFFERは含みません。
 
-### v0.6-devで絶対に行わないこと
+### v0.6.1-devで絶対に行わないこと
 
 - Windowsフォーマット
 - パーティション操作
@@ -237,7 +237,7 @@ chkdsk /f
 - [x] v0.4-dev FC/04再送案を解析により撤回・Release/tag削除
 - [x] v0.5-dev 即時Flushログ / FW検証 / FC03・FC05・FC09 read-only preflight / metadata backup / READ(10) backup
 - [x] v0.5.1-dev MSVC例外処理まで含む純正Updater再監査 / 99%進捗ロジック固定テスト
-- [x] v0.6-dev No Media LBA0 direct READ(10) / FAT・MBR解析 / rescue image / MSFWUPGR.UPG抽出・公式SHA比較
+- [x] v0.6.1-dev No Media LBA0 direct READ(10) / FAT・MBR解析 / rescue image / MSFWUPGR.UPG抽出・公式SHA比較
 - [x] 故障実機からv0.3.1ログ収集（FC03成功 / 3A00確認）
 - [ ] SONYSPTI / scsipath経路への対応
 - [x] FC03 FW info / FC05 DeviceId経路の特定
@@ -262,7 +262,7 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 ## Disclaimer
 
-開発中の実験ツールです。現在のmain/v0.6-devは読み取り専用です。書き込み系復旧機能は、No Media状態での安全なfirmware transportまたはROM/service protocolを確認し、実機検証できるまでmainへ戻しません。
+開発中の実験ツールです。現在のmain/v0.6.1-devは読み取り専用です。書き込み系復旧機能は、No Media状態での安全なfirmware transportまたはROM/service protocolを確認し、実機検証できるまでmainへ戻しません。
 
 ---
 
@@ -270,4 +270,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.6-dev is a read-only Windows 7 No-Media rescue/forensic build. The earlier v0.4 FC/04 resume experiment was withdrawn and its release/tag deleted after a control-flow re-audit. v0.6 adds gated No-Media LBA0 rescue, FAT/MBR imaging, and recovered-UPG comparison while remaining device-side read-only.**
+**v0.6.1-dev is a read-only Windows 7 No-Media rescue/forensic build. The earlier v0.4 FC/04 resume experiment was withdrawn and its release/tag deleted after a control-flow re-audit. v0.6.1 adds gated No-Media LBA0 rescue, FAT/MBR imaging, recovered-UPG comparison, and stricter MBR/BPB bounds while remaining device-side read-only.**

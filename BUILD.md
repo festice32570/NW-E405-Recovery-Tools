@@ -2,7 +2,7 @@
 
 Native Win32 C, 32-bit (`i686`) for Windows 7 x86/x64 (WoW64). No .NET, PowerShell or Python is required at runtime.
 
-v0.6-dev is a Windows 7-targeted read-only No-Media rescue/forensic build. It links miniz only to verify/extract a user-selected official Sony self-extracting updater on the PC.
+v0.6.1-dev is a Windows 7-targeted read-only No-Media rescue/forensic build. It links miniz only to verify/extract a user-selected official Sony self-extracting updater on the PC.
 
 ```sh
 i686-w64-mingw32-windres src/app.rc -O coff -o src/app.res
@@ -30,3 +30,11 @@ python3 tools/original_updater_audit.py /path/to/FWUpdaterCom.dll /path/to/FWUpd
 ```
 
 The original-updater audit is pinned to the exact analyzed `FWUpdaterCom.dll` and `FWUpdater.exe` SHA-256 values. It verifies the MSVC exception-handler path for copy failure and separately pins the post-start 99% progress/timer behavior.
+
+After building the final EXE, validate the PE itself:
+
+```sh
+python3 tests/validate_built_pe.py
+```
+
+This checks that the artifact is 32-bit Win32 GUI, uses only Win7-era system DLLs, and has no .NET/UCRT/VCRuntime dependency.

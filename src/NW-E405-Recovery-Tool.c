@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Lab v0.6-dev"
+#define APP_TITLE L"NW-E405 Recovery Lab v0.6.1-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -1042,11 +1042,12 @@ static void RescueNoMedia(void) {
     HANDLE dev=OpenDeviceRW(g_exactDevicePath,NULL);if(dev==INVALID_HANDLE_VALUE){LogF(L"No Media rescue: device open failed %lu",GetLastError());return;}
     BYTE sec0[512];ZeroMemory(sec0,sizeof(sec0));ScsiResult tr;BOOL ok=Read10Chunk(dev,0,1,sec0,512,&tr);TraceCdbJson(&tr);
     LogF(L"");LogF(L"=== NO MEDIA DIRECT READ(10) RESCUE ===");ShowScsiResult(L"READ(10) LBA=0 blocks=1",&tr);
-    if(!ok){LogF(L"LBA0 could not be read. The normal logical-NAND SCSI read path is unavailable in this state.");CloseHandle(dev);SetStatus(L"No Media救出: LBA0も読み出せませんでした");return;}
+    if(!ok){LogF(L"LBA0 could not be read. The normal logical-NAND SCSI read path is unavailable in this state.");LogF(L"RECOVERY STATE: LOGICAL_MEDIA_UNREADABLE — next research path is Sony vendor access (A3/A4 and other read commands), then XBOOT/service ROM if needed.");CloseHandle(dev);SetStatus(L"No Media救出: LBA0も読み出せませんでした");return;}
+    { WCHAR hx[512]={0}; BytesToHex(sec0,64,hx,512); LogF(L"LBA0 first 64 bytes: %s",hx); }
     WCHAR sectorPath[MAX_PATH];_snwprintf(sectorPath,MAX_PATH-1,L"%s\\NW-E405_LBA0_%s.bin",g_exeDir,g_sessionStem);HANDLE sf=CreateFileW(sectorPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);if(sf!=INVALID_HANDLE_VALUE){DWORD wr=0;WriteFile(sf,sec0,512,&wr,NULL);FlushFileBuffers(sf);CloseHandle(sf);LogF(L"LBA0 saved: %s",sectorPath);}
     FatLayout fat;BOOL parsed=ParseFatBootSector(sec0,0,&fat);
     if(!parsed && sec0[510]==0x55 && sec0[511]==0xAA){
-        for(int i=0;i<4&&!parsed;i++){BYTE *pe=sec0+446+i*16;DWORD start=Le32(pe+8),count=Le32(pe+12);if(pe[4]&&start&&count&&((uint64_t)start+count)<0x400000ULL){BYTE boot[512];ScsiResult br;if(Read10Chunk(dev,start,1,boot,512,&br)){TraceCdbJson(&br);parsed=ParseFatBootSector(boot,start,&fat);if(parsed)LogF(L"MBR partition %d selected: type=%02X start=%lu sectors=%lu",i,pe[4],start,count);}else TraceCdbJson(&br);}}
+        for(int i=0;i<4&&!parsed;i++){BYTE *pe=sec0+446+i*16;DWORD start=Le32(pe+8),count=Le32(pe+12);if(pe[4]&&start&&count&&((uint64_t)start+count)<0x400000ULL){BYTE boot[512];ScsiResult br;if(Read10Chunk(dev,start,1,boot,512,&br)){TraceCdbJson(&br);parsed=ParseFatBootSector(boot,start,&fat);if(parsed && fat.totalSectors>count){LogF(L"Rejecting partition %d: BPB total sectors %lu exceeds MBR partition size %lu",i,fat.totalSectors,count);parsed=FALSE;}if(parsed)LogF(L"MBR partition %d selected: type=%02X start=%lu sectors=%lu",i,pe[4],start,count);}else TraceCdbJson(&br);}}
     }
     if(!parsed){LogF(L"LBA0 is readable, but a supported FAT12/16/32 geometry could not be derived. No bulk read attempted.");CloseHandle(dev);SetStatus(L"LBA0読出し成功 — FAT/MBR解析はできませんでした");return;}
     uint64_t bytes=(uint64_t)fat.totalSectors*512ULL;LogF(L"Derived FAT%d: volumeStart=%lu totalSectors=%lu (~%I64u bytes) SPC=%lu FATs=%lu SPF=%lu",fat.fatType,fat.volumeStartLba,fat.totalSectors,bytes,fat.sectorsPerCluster,fat.fatCount,fat.sectorsPerFat);
@@ -1054,8 +1055,8 @@ static void RescueNoMedia(void) {
     if(MessageBoxW(g_hwnd,msg,L"Create rescue image?",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES){CloseHandle(dev);return;}
     WCHAR imagePath[MAX_PATH];BOOL imaged=ImageDerivedLayout(dev,&fat,imagePath);CloseHandle(dev);if(!imaged){SetStatus(L"救出イメージは途中で停止しました（partial保持）");return;}
     WCHAR upgPath[MAX_PATH]={0},hash[65]={0};BOOL got=ExtractRootUpgFromImage(imagePath,&fat,upgPath,hash);
-    if(got){LogF(L"Recovered root MSFWUPGR.UPG: %s",upgPath);LogF(L"Recovered UPG SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691"))LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");else LogF(L"UPG COMPARISON: DOES NOT MATCH verified Japanese v2.0 UPG.");}
-    else {uint64_t off=0;if(ScanImageForUpg(imagePath,upgPath,hash,&off)){LogF(L"FAT root extraction failed, but raw UPGR_FMT candidate was found at image offset 0x%I64X",off);LogF(L"Raw candidate: %s",upgPath);LogF(L"Raw candidate SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691"))LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");else LogF(L"UPG COMPARISON: candidate header matches but SHA-256 differs from official v2.0.");}else LogF(L"No MSFWUPGR.UPG root entry or raw UPGR_FMT candidate was found in the rescued image.");}
+    if(got){LogF(L"Recovered root MSFWUPGR.UPG: %s",upgPath);LogF(L"Recovered UPG SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691")){LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");LogF(L"RECOVERY STATE: PACKAGE_INTACT — PC-side update package survived intact; failure is more likely after update-start. Destructive retry remains locked.");}else{LogF(L"UPG COMPARISON: DOES NOT MATCH verified Japanese v2.0 UPG.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH — do NOT start firmware update from this on-device package.");}}
+    else {uint64_t off=0;if(ScanImageForUpg(imagePath,upgPath,hash,&off)){LogF(L"FAT root extraction failed, but raw UPGR_FMT candidate was found at image offset 0x%I64X",off);LogF(L"Raw candidate: %s",upgPath);LogF(L"Raw candidate SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691")){LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");LogF(L"RECOVERY STATE: PACKAGE_INTACT_RAW — official package bytes are present even though FAT extraction failed.");}else{LogF(L"UPG COMPARISON: candidate header matches but SHA-256 differs from official v2.0.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH_RAW — do NOT use this candidate for update-start.");}}else{LogF(L"No MSFWUPGR.UPG root entry or raw UPGR_FMT candidate was found in the rescued image.");LogF(L"RECOVERY STATE: PACKAGE_NOT_FOUND — repair needs a verified way to restore the package or a lower-level flash transport.");}}
     SaveLog();SetStatus(L"No Media救出解析完了 — ログとIMG/UPG候補を確認してください");
     MessageBoxW(g_hwnd,L"No Media救出解析が完了しました。\n\nログフォルダにIMGと、見つかった場合はMSFWUPGR.UPG候補を保存しました。\nTXT/JSONLと一緒にIssue #1へ添付してください。",L"Rescue analysis complete",MB_OK|MB_ICONINFORMATION);
 }
