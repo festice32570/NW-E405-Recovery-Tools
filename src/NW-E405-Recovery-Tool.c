@@ -11,7 +11,7 @@
 #include <wchar.h>
 #include <shellapi.h>
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.2.1-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.3-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -331,6 +331,92 @@ static int ProbeRemovableDriveLetters(void) {
     return found;
 }
 
+static int ProbeSonyScsiPaths(void) {
+    int matches = 0;
+    LogF(L"");
+    LogF(L"=== Sony/NT scsipath probe ===");
+    LogF(L"Checking \\\\.\\scsipath0 ... \\\\.\\scsipath25 (read-only commands only)");
+
+    for (int i = 0; i < 26; ++i) {
+        WCHAR path[64];
+        _snwprintf(path, 64, L"\\\\.\\scsipath%d", i);
+
+        DWORD err = 0;
+        HANDLE h = OpenDeviceRW(path, &err);
+        if (h == INVALID_HANDLE_VALUE)
+            continue;
+
+        LogF(L"scsipath%d: OPEN", i);
+
+        BYTE cdb[16] = {0};
+        cdb[0] = 0x12;
+        cdb[4] = 96;
+        ScsiResult inq = SendCdb(h, cdb, 6, 96);
+
+        WCHAR vendor[32] = {0}, product[64] = {0}, rev[16] = {0};
+        if (inq.ioctlOk && inq.scsiStatus == 0 && inq.dataLen >= 36) {
+            BytesToAscii(inq.data, 8, 8, vendor, 32);
+            BytesToAscii(inq.data, 16, 16, product, 64);
+            BytesToAscii(inq.data, 32, 4, rev, 16);
+            LogF(L"  INQUIRY: Vendor=[%s] Product=[%s] Rev=[%s]",
+                vendor, product, rev);
+        } else {
+            LogF(L"  INQUIRY failed: IOCTL=%d Status=0x%02X Win32=%lu Sense=%s %02X/%02X",
+                inq.ioctlOk, inq.scsiStatus, inq.winErr,
+                SenseName(inq.sense[2]), inq.sense[12], inq.sense[13]);
+            CloseHandle(h);
+            continue;
+        }
+
+        BOOL expected =
+            ContainsI(vendor, L"SONY") &&
+            ContainsI(product, L"NWWM MEM AAD2");
+
+        if (!expected) {
+            LogF(L"  Not NW-E40X SCSI identity; no Sony vendor command sent.");
+            CloseHandle(h);
+            continue;
+        }
+
+        matches++;
+        LogF(L"  >>> NW-E405/NW-E40X candidate on scsipath%d", i);
+
+        if (!g_exactUsbPresent) {
+            LogF(L"  SAFETY: exact USB VID_054C&PID_01FB is absent; FC/03 skipped.");
+            CloseHandle(h);
+            continue;
+        }
+
+        ZeroMemory(cdb, sizeof(cdb));
+        cdb[0] = 0xFC;
+        cdb[2] = 0x03;
+        cdb[7] = 0x00;
+        cdb[8] = 0x40;
+
+        ScsiResult sonyInfo = SendCdb(h, cdb, 12, 64);
+        ShowScsiResult(L"SONY 0xFC/0x03 via scsipath (read-only)", &sonyInfo);
+
+        if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0) {
+            WCHAR ascii[129] = {0};
+            BytesToAscii(sonyInfo.data, 0, sonyInfo.dataLen, ascii, 129);
+            LogF(L"scsipath%d RESULT: FC/03 SUCCESS", i);
+            LogF(L"Response ASCII: %s", ascii);
+        } else {
+            LogF(L"scsipath%d RESULT: FC/03 failed: %s ASC/ASCQ=%02X/%02X",
+                i, SenseName(sonyInfo.sense[2]), sonyInfo.sense[12], sonyInfo.sense[13]);
+        }
+
+        CloseHandle(h);
+    }
+
+    if (matches == 0)
+        LogF(L"No SONY / NWWM MEM AAD2 device was found through scsipath0..25.");
+
+    LogF(L"scsipath matches: %d", matches);
+    LogF(L"");
+    return matches;
+}
+
 static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int index, BOOL exactMapped) {
     DWORD err = 0;
     HANDLE h = OpenDeviceRW(path, &err);
@@ -520,10 +606,15 @@ static void RunDiagnostics(void) {
         fallback = ProbeRemovableDriveLetters();
     }
 
+    int scsiPathMatches = 0;
+    if (usb)
+        scsiPathMatches = ProbeSonyScsiPaths();
+
     LogF(L"=== SUMMARY ===");
     LogF(L"Exact USB VID/PID 054C:01FB found: %s", usb ? L"YES" : L"NO");
     LogF(L"Mapped SONY/NWWM disk candidates: %d", sony);
     LogF(L"Drive-letter fallback matches: %d", fallback);
+    LogF(L"Sony scsipath matches: %d", scsiPathMatches);
 
     if (sony == 0 && fallback > 0 && usb) {
         LogF(L"");

@@ -7,7 +7,7 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.2.1-dev
+## GUI版 v0.3-dev
 
 現在の推奨版は **`NW-E405-Recovery-Tool.exe`** です。
 
@@ -27,7 +27,7 @@ NW-E405_diag_YYYYMMDD_HHMMSS.txt
 
 6. **「結果をコピー」** またはログファイルを使って結果を共有してください。
 
-## v0.2.1-devで実行する処理
+## v0.3-devで実行する処理
 
 Stage 1は意図的に **READ-ONLY** です。
 
@@ -50,8 +50,19 @@ Stage 1は意図的に **READ-ONLY** です。
 - ファームウェア書き込み
 - Sony更新開始コマンド `0xFC / 0x04`
 
-そのため、v0.2.1-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
+そのため、v0.3-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
 
+
+
+## v0.3-dev: scsipath診断
+
+v0.2.1-devの実機ログでは、通常のDisk interface経由でSCSI INQUIRYは成功した一方、`TEST UNIT READY` / `READ CAPACITY` は `NOT READY / 3A00 (Medium Not Present)`、Sony `0xFC/0x03` は `ILLEGAL REQUEST / 2000 (Invalid Command Operation Code)` になりました。
+
+純正 `FWUpdaterCom.dll` のWindows NT系コードを再解析した結果、当時のUpdaterは `SONYSPTI` ではなく `\\.\scsipath0` ～ `\\.\scsipath25` を列挙し、そのパスに対して `IOCTL_SCSI_PASS_THROUGH_DIRECT (0x4D014)` を使用していることを確認しました。
+
+v0.3-devでは、正しいNW-E405 USB ID (`054C:01FB`) が存在する場合に限り、`scsipath0..25` を開いて標準SCSI INQUIRYを実行します。`SONY / NWWM MEM AAD2` が確認できたパスだけで、読み取り系Sony `0xFC/0x03` を再テストします。
+
+**SCSI DATA OUT経路および `0xFC/0x04` 更新開始コマンドはこの版にも含まれていません。**
 
 ## 機種判定の検証
 
@@ -133,6 +144,7 @@ chkdsk /f
 - [x] FWUpdaterCom.dllのSCSI経路確認
 - [x] PowerShell READ-ONLY prototype v0.1
 - [x] Windows 7対応ネイティブGUI v0.2.1-dev
+- [x] Windows NT系 scsipath0..25 読み取り診断 v0.3-dev
 - [ ] 故障実機からGUI版ログ収集
 - [ ] SONYSPTI / scsipath経路への対応
 - [ ] Sony vendor command応答の詳細解析
@@ -162,4 +174,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.2.1-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
+**v0.3-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
