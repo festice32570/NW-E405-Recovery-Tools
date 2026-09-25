@@ -144,3 +144,19 @@ FC/04 is no longer treated as a generic recovery command. v0.7 makes it reachabl
 ### Privacy
 
 Full CDB JSONL, metadata, DvID, sectors, images and recovered UPG files are private evidence. v0.7 generates a separate public report containing only status flags and hashes.
+
+## A600 extended-updater comparison (2026-09-26)
+
+Sony's official `NW-A600_V2_0.exe` is a useful same-generation comparison target. The exact package analyzed locally has SHA-256 `3ea05d6601e0e1c7a039f1c88fcc9cca9a49682cd87ef5e604bbc570ec89d552`; its `FWUpdaterCom.dll` has SHA-256 `56aa815bbe6e3441bd3e3168e9511dce94f2e0927167f1671f1a9a8c40ca58bf`.
+
+Unlike the E40X updater, the A600 package contains `PBR512.dat`, `PBR1G.dat`, and `PBR2G.dat`, and its INI uses `StorageMediaFormatType` and `PBRFile`. The DLL exposes an `IFWUpdaterComExt` interface including `CheckStorageFormatType`, `SendFWUpdateCommandExt`, `DeleteUpdateFileExt`, and `GetDeviceIdExt`.
+
+Static analysis of the exact DLL shows that the storage-format check builds SCSI READ(10) (`0x28`) with a 512-byte transfer. It first reads LBA0, then takes the DWORD at offset `0x1C6` of that sector (the first MBR partition entry's starting-LBA field), converts it to the CDB LBA field, and reads that sector too. It then opens the model-specific PBR file on the PC and compares BPB portions of the device PBR and the template: 12 bytes starting at offset `0x0B` and 8 bytes starting at offset `0x1C`.
+
+The three PBR files are 512-byte FAT16 boot-sector templates with `55 AA` signatures and model/capacity-specific BPB geometry. This strongly supports interpreting `CheckStorageFormatType` as a FAT16 geometry/PBR compatibility check rather than a generic disk-capacity test.
+
+`SendFWUpdateCommandExt` imports and uses `CopyFileA`, and its extended update path also contains the Sony `FC/04` update-start builder. No explicit standard SCSI WRITE(10) (`0x2A`), WRITE(12) (`0xAA`), WRITE BUFFER (`0x3B`) or `0x3F` CDB builder was found in this DLL. Current evidence therefore favors a design where the PC stages files and invokes the player-side update mechanism rather than writing the PBR with a standard raw-sector WRITE command from Windows. This does not yet prove the exact device-side handling of the PBR file.
+
+The E40X updater has no `PBR`, `StorageMediaFormatType`, `CheckStorageFormatType`, `SendFWUpdateCommandExt`, `DeleteUpdateFileExt`, `GetDeviceIdExt`, or `FWPackageWritePathName` strings. The extended mechanism appears to have been added in the A600-generation updater rather than being exposed in the E405 updater.
+
+Reproducible checks are in `tools/a600_ext_audit.py`; the Sony binaries themselves are not committed.
