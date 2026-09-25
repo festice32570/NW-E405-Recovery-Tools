@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Lab v0.6.1-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.7-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -54,6 +54,15 @@ static BOOL g_officialFirmwareVerified = FALSE;
 static WCHAR g_verifiedUpgPath[MAX_PATH] = {0};
 static WCHAR g_exactDevicePath[1024] = {0};
 static BOOL g_noMediaRescueAvailable = FALSE;
+static BOOL g_lba0Unreadable = FALSE;
+static BOOL g_rootPackageIntact = FALSE;
+static BOOL g_resumeEligible = FALSE;
+static BOOL g_vendorDvIdRead = FALSE;
+static BYTE g_vendorDvId[16] = {0};
+static WCHAR g_vendorDvIdSha256[65] = {0};
+static uint64_t g_rescueFreeBytes = 0;
+static BOOL g_rescueFreeKnown = FALSE;
+static WCHAR g_publicReportPath[MAX_PATH] = {0};
 
 typedef struct {
     SCSI_PASS_THROUGH_DIRECT sptd;
@@ -75,6 +84,7 @@ typedef struct {
     DWORD requestedDataLen;
     DWORD elapsedMs;
     LONG traceSeq;
+    int direction; /* 0=none, 1=in, 2=out */
 } ScsiResult;
 
 typedef struct {
@@ -99,6 +109,8 @@ static BOOL StartSessionLogs(void);
 static void CloseSessionLogs(void);
 static void SaveMetadataBackup(void);
 static BOOL SaveLog(void);
+static void SavePublicReport(void);
+static void RunRecoveryLadder(void);
 
 static void PumpMessages(void) {
     MSG msg;
@@ -221,7 +233,7 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
     ZeroMemory(&r, sizeof(r));
     if (h == INVALID_HANDLE_VALUE) return r;
     r.opened = TRUE;
-    r.cdbLen = cdbLen; r.targetId = targetId; r.requestedDataLen = dataLen;
+    r.cdbLen = cdbLen; r.targetId = targetId; r.requestedDataLen = dataLen; r.direction = dataLen ? 1 : 0;
     CopyMemory(r.cdb, cdb, cdbLen > 16 ? 16 : cdbLen);
 
     BYTE *data = NULL;
@@ -273,6 +285,62 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
     return SendCdbEx(h, cdb, cdbLen, dataLen, 0);
 }
 
+
+static ScsiResult SendFixedA3SelectDeviceId(HANDLE h) {
+    ScsiResult r; ZeroMemory(&r,sizeof(r)); r.opened=TRUE;
+    static const BYTE cdb[12]={0xA3,0,0,0,0,0,0,0xBC,0,0x14,0x30,0};
+    BYTE payload[20]={0}; payload[1]=0x12;
+    r.cdbLen=12; r.targetId=0; r.requestedDataLen=20; r.direction=2;
+    CopyMemory(r.cdb,cdb,12); r.dataLen=20; CopyMemory(r.data,payload,20);
+    r.traceSeq=InterlockedIncrement(&g_cdbSequence); TraceCdbIntentJson(&r);
+    SPTDWB pkt; ZeroMemory(&pkt,sizeof(pkt));
+    pkt.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT); pkt.sptd.PathId=0; pkt.sptd.TargetId=0; pkt.sptd.Lun=0;
+    pkt.sptd.CdbLength=12; pkt.sptd.SenseInfoLength=18; pkt.sptd.DataIn=SCSI_IOCTL_DATA_OUT;
+    pkt.sptd.DataTransferLength=20; pkt.sptd.TimeOutValue=5; pkt.sptd.DataBuffer=payload;
+    pkt.sptd.SenseInfoOffset=offsetof(SPTDWB,sense); CopyMemory(pkt.sptd.Cdb,cdb,12);
+    DWORD ret=0,started=GetTickCount();
+    BOOL ok=DeviceIoControl(h,IOCTL_SCSI_PASS_THROUGH_DIRECT,&pkt,sizeof(pkt),&pkt,sizeof(pkt),&ret,NULL);
+    r.elapsedMs=GetTickCount()-started; r.ioctlOk=ok; r.winErr=ok?ERROR_SUCCESS:GetLastError(); r.scsiStatus=pkt.sptd.ScsiStatus;
+    CopyMemory(r.sense,pkt.sense,18); TraceCdbJson(&r); return r;
+}
+
+static BOOL Sha256BytesHex(const BYTE *data, DWORD len, WCHAR out[65]) {
+    out[0]=0; HCRYPTPROV prov=0; HCRYPTHASH hash=0; BOOL ok=FALSE;
+    if(!CryptAcquireContextW(&prov,NULL,NULL,PROV_RSA_AES,CRYPT_VERIFYCONTEXT)) return FALSE;
+    if(CryptCreateHash(prov,CALG_SHA_256,0,0,&hash) && CryptHashData(hash,data,len,0)){
+        BYTE hv[32]; DWORD cb=32; if(CryptGetHashParam(hash,HP_HASHVAL,hv,&cb,0)&&cb==32){
+            static const WCHAR hx[]=L"0123456789abcdef"; for(int i=0;i<32;i++){out[i*2]=hx[hv[i]>>4];out[i*2+1]=hx[hv[i]&15];}out[64]=0;ok=TRUE;
+        }
+    }
+    if(hash)CryptDestroyHash(hash);CryptReleaseContext(prov,0);return ok;
+}
+
+static BOOL QueryVendorDvId(void) {
+    if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
+        LogF(L"A3/A4 vendor query locked: Issue #1 state is not currently established."); return FALSE;
+    }
+    HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL); if(h==INVALID_HANDLE_VALUE){LogF(L"A3/A4: device open failed %lu",GetLastError());return FALSE;}
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2: Sony MP3FM A3/A4 Device-ID query ===");
+    LogF(L"A3/A4 sequence is fixed to the NW-E405 capture: A3 selects the 18-byte record; A4 reads it.");
+    LogF(L"A3 is the only DATA OUT command in this build; payload is fixed to 00 12 followed by zeros.");
+    ScsiResult sel=SendFixedA3SelectDeviceId(h);
+    LogF(L"A3 select: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X",sel.ioctlOk?L"OK":L"FAIL",sel.scsiStatus,sel.sense[12],sel.sense[13]);
+    if(!sel.ioctlOk || sel.scsiStatus!=0){CloseHandle(h);LogF(L"A3 select failed; A4 was NOT sent.");return FALSE;}
+    BYTE cdb[12]={0xA4,0,0,0,0,0,0,0xBC,0,0x12,0x3F,0};
+    ScsiResult rd=SendCdb(h,cdb,12,18); CloseHandle(h);
+    LogF(L"A4 read: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X DataLen=%lu",rd.ioctlOk?L"OK":L"FAIL",rd.scsiStatus,rd.sense[12],rd.sense[13],rd.dataLen);
+    if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.dataLen<18 || rd.data[0]!=0x00 || rd.data[1]!=0x10){LogF(L"A4 response did not match the expected 00 10 + 16-byte record shape.");return FALSE;}
+    BOOL nz=FALSE;for(int i=2;i<18;i++)if(rd.data[i])nz=TRUE;if(!nz){LogF(L"A4 returned an all-zero Device-ID record.");return FALSE;}
+    CopyMemory(g_vendorDvId,rd.data+2,16);g_vendorDvIdRead=TRUE;Sha256BytesHex(g_vendorDvId,16,g_vendorDvIdSha256);
+    WCHAR path[MAX_PATH];_snwprintf(path,MAX_PATH-1,L"%s\\NW-E405_DvID_PRIVATE_%s.bin",g_exeDir,g_sessionStem);
+    HANDLE out=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
+    if(out!=INVALID_HANDLE_VALUE){DWORD wr=0;WriteFile(out,g_vendorDvId,16,&wr,NULL);FlushFileBuffers(out);CloseHandle(out);}
+    LogF(L"A3/A4 Device-ID query SUCCESS. Device-ID SHA-256: %s",g_vendorDvIdSha256);
+    LogF(L"PRIVATE evidence saved: %s",path);
+    LogF(L"Do NOT post the private DvID file or raw JSONL trace to a public GitHub issue.");
+    return TRUE;
+}
+
 static void TraceCdbIntentJson(const ScsiResult *r) {
     if (!r || g_jsonLog == INVALID_HANDLE_VALUE) return;
     WCHAR cdbHex[96]={0}; char cdbA[192]={0}, line[1024];
@@ -282,7 +350,7 @@ static void TraceCdbIntentJson(const ScsiResult *r) {
     int n=_snprintf(line,sizeof(line)-1,
         "{\"seq\":%ld,\"phase\":\"intent\",\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu}\r\n",
         r->traceSeq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
-        r->targetId,cdbA,r->requestedDataLen?"IN":"NONE",r->requestedDataLen);
+        r->targetId,cdbA,r->direction==2?"OUT":(r->direction==1?"IN":"NONE"),r->requestedDataLen);
     if (n>0) { DWORD wr=0; WriteFile(g_jsonLog,line,(DWORD)n,&wr,NULL); FlushFileBuffers(g_jsonLog); }
 }
 
@@ -301,7 +369,7 @@ static void TraceCdbJson(const ScsiResult *r) {
     int n=_snprintf(line,sizeof(line)-1,
         "{\"seq\":%ld,\"phase\":\"result\",\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu,\"ioctl_ok\":%s,\"win32\":%lu,\"scsi_status\":%u,\"sense\":\"%s\",\"data\":\"%s\",\"elapsed_ms\":%lu}\r\n",
         r->traceSeq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
-        r->targetId,cdbA,r->requestedDataLen?"IN":"NONE",r->requestedDataLen,r->ioctlOk?"true":"false",r->winErr,r->scsiStatus,senseA,dataA,r->elapsedMs);
+        r->targetId,cdbA,r->direction==2?"OUT":(r->direction==1?"IN":"NONE"),r->requestedDataLen,r->ioctlOk?"true":"false",r->winErr,r->scsiStatus,senseA,dataA,r->elapsedMs);
     if (n>0) { DWORD wr=0; WriteFile(g_jsonLog,line,(DWORD)n,&wr,NULL); FlushFileBuffers(g_jsonLog); }
 }
 
@@ -403,6 +471,14 @@ static BOOL ScanSonyUsbDevices(void) {
     if (!exact) LogF(L"Exact NW-E405 ID VID_054C&PID_01FB was not found.");
     g_exactUsbPresent = exact;
     return exact;
+}
+
+static BOOL IsExactUsbPresentSilent(void) {
+    HDEVINFO set=SetupDiGetClassDevsW(NULL,NULL,NULL,DIGCF_PRESENT|DIGCF_ALLCLASSES); if(set==INVALID_HANDLE_VALUE)return FALSE;
+    BOOL exact=FALSE; SP_DEVINFO_DATA dev;dev.cbSize=sizeof(dev);
+    for(DWORD i=0;SetupDiEnumDeviceInfo(set,i,&dev);++i){WCHAR ids[2048]={0};DWORD type=0,req=0;
+        if(SetupDiGetDeviceRegistryPropertyW(set,&dev,SPDRP_HARDWAREID,&type,(PBYTE)ids,sizeof(ids),&req)&&ContainsI(ids,SONY_VIDPID)){exact=TRUE;break;}dev.cbSize=sizeof(dev);}
+    SetupDiDestroyDeviceInfoList(set);return exact;
 }
 
 static BOOL DevNodeHasExactNwE405Ancestor(DEVINST devInst) {
@@ -848,7 +924,7 @@ static BOOL Read10Chunk(HANDLE h, DWORD lba, WORD blocks, BYTE *buf, DWORD bytes
     cdb[7]=(BYTE)(blocks>>8); cdb[8]=(BYTE)blocks;
     if (summary) {
         ZeroMemory(summary,sizeof(*summary)); summary->opened=TRUE; summary->cdbLen=10; summary->targetId=0;
-        summary->requestedDataLen=bytes; CopyMemory(summary->cdb,cdb,10);
+        summary->requestedDataLen=bytes; summary->direction=1; CopyMemory(summary->cdb,cdb,10);
         summary->traceSeq=InterlockedIncrement(&g_cdbSequence); TraceCdbIntentJson(summary);
     }
     DWORD ret=0,started=GetTickCount();
@@ -936,6 +1012,15 @@ static BOOL FatReadNextCluster(HANDLE img, const FatLayout *f, DWORD cluster, DW
         v = Le32(b) & 0x0FFFFFFF;
     }
     *next = v; return TRUE;
+}
+
+static BOOL FatCountFreeBytes(HANDLE img, const FatLayout *f, uint64_t *freeBytes) {
+    if(!img || !f || !f->valid || !freeBytes) return FALSE;
+    DWORD dataSectors=f->totalSectors-f->firstDataSector;
+    DWORD clusters=dataSectors/f->sectorsPerCluster;
+    uint64_t freeClusters=0;
+    for(DWORD c=2;c<clusters+2;c++){DWORD v=0;if(!FatReadNextCluster(img,f,c,&v))return FALSE;if(v==0)freeClusters++;}
+    *freeBytes=freeClusters*(uint64_t)f->sectorsPerCluster*512ULL;return TRUE;
 }
 
 static BOOL FatIsEoc(const FatLayout *f, DWORD c) {
@@ -1037,12 +1122,13 @@ static BOOL ImageDerivedLayout(HANDLE dev, const FatLayout *f, WCHAR finalPath[M
 }
 
 static void RescueNoMedia(void) {
+    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(!g_noMediaRescueAvailable || !g_exactDevicePath[0]){MessageBoxW(g_hwnd,L"先に診断を実行し、Issue #1のNo Media状態を確認してください。",L"Rescue locked",MB_OK|MB_ICONWARNING);return;}
     int ans=MessageBoxW(g_hwnd,L"No Media状態でもLBA0をREAD(10)で512バイトだけ直接読みます。\n\n本体への書き込みコマンドは一切送信しません。\nLBA0が読めた場合だけFAT/MBRを解析し、続けてイメージ救出を提案します。\n\n開始しますか？",L"No Media read-only rescue",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);if(ans!=IDYES)return;
     HANDLE dev=OpenDeviceRW(g_exactDevicePath,NULL);if(dev==INVALID_HANDLE_VALUE){LogF(L"No Media rescue: device open failed %lu",GetLastError());return;}
     BYTE sec0[512];ZeroMemory(sec0,sizeof(sec0));ScsiResult tr;BOOL ok=Read10Chunk(dev,0,1,sec0,512,&tr);TraceCdbJson(&tr);
     LogF(L"");LogF(L"=== NO MEDIA DIRECT READ(10) RESCUE ===");ShowScsiResult(L"READ(10) LBA=0 blocks=1",&tr);
-    if(!ok){LogF(L"LBA0 could not be read. The normal logical-NAND SCSI read path is unavailable in this state.");LogF(L"RECOVERY STATE: LOGICAL_MEDIA_UNREADABLE — next research path is Sony vendor access (A3/A4 and other read commands), then XBOOT/service ROM if needed.");CloseHandle(dev);SetStatus(L"No Media救出: LBA0も読み出せませんでした");return;}
+    if(!ok){g_lba0Unreadable=TRUE;LogF(L"LBA0 could not be read. The normal logical-NAND SCSI read path is unavailable in this state.");LogF(L"RECOVERY STATE: LOGICAL_MEDIA_UNREADABLE — next research path is Sony vendor access (A3/A4 and other read commands), then XBOOT/service ROM if needed.");CloseHandle(dev);SetStatus(L"No Media救出: LBA0も読み出せませんでした");return;}
     { WCHAR hx[512]={0}; BytesToHex(sec0,64,hx,512); LogF(L"LBA0 first 64 bytes: %s",hx); }
     WCHAR sectorPath[MAX_PATH];_snwprintf(sectorPath,MAX_PATH-1,L"%s\\NW-E405_LBA0_%s.bin",g_exeDir,g_sessionStem);HANDLE sf=CreateFileW(sectorPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);if(sf!=INVALID_HANDLE_VALUE){DWORD wr=0;WriteFile(sf,sec0,512,&wr,NULL);FlushFileBuffers(sf);CloseHandle(sf);LogF(L"LBA0 saved: %s",sectorPath);}
     FatLayout fat;BOOL parsed=ParseFatBootSector(sec0,0,&fat);
@@ -1054,8 +1140,16 @@ static void RescueNoMedia(void) {
     WCHAR msg[512];_snwprintf(msg,511,L"LBA0の直接読み出しに成功しました。FAT%dとして約%I64u MiBを推定しました。\n\nREAD(10)だけで論理ストレージの救出イメージを作成しますか？\n本体への書き込みは行いません。",fat.fatType,bytes/(1024*1024));msg[511]=0;
     if(MessageBoxW(g_hwnd,msg,L"Create rescue image?",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES){CloseHandle(dev);return;}
     WCHAR imagePath[MAX_PATH];BOOL imaged=ImageDerivedLayout(dev,&fat,imagePath);CloseHandle(dev);if(!imaged){SetStatus(L"救出イメージは途中で停止しました（partial保持）");return;}
+    { HANDLE ih=CreateFileW(imagePath,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL); if(ih!=INVALID_HANDLE_VALUE){uint64_t fb=0;if(FatCountFreeBytes(ih,&fat,&fb)){g_rescueFreeKnown=TRUE;g_rescueFreeBytes=fb;LogF(L"FAT free space in rescued image: %I64u bytes",fb);}CloseHandle(ih);} }
     WCHAR upgPath[MAX_PATH]={0},hash[65]={0};BOOL got=ExtractRootUpgFromImage(imagePath,&fat,upgPath,hash);
-    if(got){LogF(L"Recovered root MSFWUPGR.UPG: %s",upgPath);LogF(L"Recovered UPG SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691")){LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");LogF(L"RECOVERY STATE: PACKAGE_INTACT — PC-side update package survived intact; failure is more likely after update-start. Destructive retry remains locked.");}else{LogF(L"UPG COMPARISON: DOES NOT MATCH verified Japanese v2.0 UPG.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH — do NOT start firmware update from this on-device package.");}}
+    if(got){LogF(L"Recovered root MSFWUPGR.UPG: %s",upgPath);LogF(L"Recovered UPG SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691")){
+            g_rootPackageIntact=TRUE; LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");
+            uint64_t clusterBytes=(uint64_t)fat.sectorsPerCluster*512ULL; uint64_t allocated=((2131380ULL+clusterBytes-1)/clusterBytes)*clusterBytes;
+            uint64_t estimatedBefore=g_rescueFreeKnown?(g_rescueFreeBytes+allocated):0;
+            if(g_rescueFreeKnown)LogF(L"Estimated free space before UPG copy: %I64u bytes (current free + UPG allocated clusters)",estimatedBefore);
+            if(g_rescueFreeKnown && estimatedBefore>=3000000ULL){g_resumeEligible=TRUE;LogF(L"RECOVERY STATE: PACKAGE_INTACT — package intact and estimated pre-copy free space meets Sony's ~3 MB requirement.");}
+            else{g_resumeEligible=FALSE;LogF(L"RECOVERY STATE: PACKAGE_INTACT_BUT_SPACE_UNCERTAIN — FC/04 retry remains locked.");}
+        }else{LogF(L"UPG COMPARISON: DOES NOT MATCH verified Japanese v2.0 UPG.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH — do NOT start firmware update from this on-device package.");}}
     else {uint64_t off=0;if(ScanImageForUpg(imagePath,upgPath,hash,&off)){LogF(L"FAT root extraction failed, but raw UPGR_FMT candidate was found at image offset 0x%I64X",off);LogF(L"Raw candidate: %s",upgPath);LogF(L"Raw candidate SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691")){LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");LogF(L"RECOVERY STATE: PACKAGE_INTACT_RAW — official package bytes are present even though FAT extraction failed.");}else{LogF(L"UPG COMPARISON: candidate header matches but SHA-256 differs from official v2.0.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH_RAW — do NOT use this candidate for update-start.");}}else{LogF(L"No MSFWUPGR.UPG root entry or raw UPGR_FMT candidate was found in the rescued image.");LogF(L"RECOVERY STATE: PACKAGE_NOT_FOUND — repair needs a verified way to restore the package or a lower-level flash transport.");}}
     SaveLog();SetStatus(L"No Media救出解析完了 — ログとIMG/UPG候補を確認してください");
     MessageBoxW(g_hwnd,L"No Media救出解析が完了しました。\n\nログフォルダにIMGと、見つかった場合はMSFWUPGR.UPG候補を保存しました。\nTXT/JSONLと一緒にIssue #1へ添付してください。",L"Rescue analysis complete",MB_OK|MB_ICONINFORMATION);
@@ -1093,11 +1187,95 @@ static void BackupLogicalMedia(void) {
     else {LogF(L"Partial image retained for analysis: %s",partial);SetStatus(L"バックアップ途中で停止 — partialを保持しました");}
 }
 
+static void SavePublicReport(void) {
+    if(!g_sessionStem[0])return;
+    _snwprintf(g_publicReportPath,MAX_PATH-1,L"%s\\NW-E405_PUBLIC_REPORT_%s.txt",g_exeDir,g_sessionStem);
+    HANDLE h=CreateFileW(g_publicReportPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
+    if(h==INVALID_HANDLE_VALUE)return;
+    DWORD wr=0;BYTE bom[3]={0xEF,0xBB,0xBF};WriteFile(h,bom,3,&wr,NULL);
+    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.7-dev - PUBLIC REPORT");
+    WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID, image sectors, music data, or full vendor responses.");
+    WCHAR b[512];
+    _snwprintf(b,511,L"Exact USB/SCSI identity: %s",g_exactDevicePath[0]?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"TUR Medium Not Present 3A00: %s",g_issue1TurNoMedia?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"READ CAPACITY Medium Not Present 3A00: %s",g_issue1CapNoMedia?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"Known FC/03 1.x response: %s",g_issue1FwInfoMatch?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"LBA0 unreadable: %s",g_lba0Unreadable?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"Root MSFWUPGR.UPG exact official match: %s",g_rootPackageIntact?L"YES":L"NO");WriteUtf8Line(h,b);
+    if(g_rescueFreeKnown){_snwprintf(b,511,L"Rescued FAT current free bytes: %I64u",g_rescueFreeBytes);WriteUtf8Line(h,b);}
+    _snwprintf(b,511,L"Recovery resume eligibility: %s",g_resumeEligible?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"A3/A4 Device-ID query: %s",g_vendorDvIdRead?L"SUCCESS":L"NOT ACQUIRED");WriteUtf8Line(h,b);
+    if(g_vendorDvIdRead){_snwprintf(b,511,L"Device-ID SHA-256 only: %s",g_vendorDvIdSha256);WriteUtf8Line(h,b);}
+    WriteUtf8Line(h,L"PRIVATE: JSONL trace, metadata.bin, DvID bin, LBA/IMG, recovered UPG. Do NOT attach those to a public issue unless intentionally sharing their contents.");
+    FlushFileBuffers(h);CloseHandle(h);
+}
+
 static BOOL SaveLog(void) {
     BOOL ok=TRUE;
     if(g_liveLog!=INVALID_HANDLE_VALUE) ok=FlushFileBuffers(g_liveLog)&&ok;
     if(g_jsonLog!=INVALID_HANDLE_VALUE) ok=FlushFileBuffers(g_jsonLog)&&ok;
     return ok;
+}
+
+static BOOL RevalidateIssue1BeforeWrite(HANDLE h) {
+    BYTE cdb[16]={0};
+    cdb[0]=0x12;cdb[4]=96;ScsiResult inq=SendCdb(h,cdb,6,96);
+    WCHAR vendor[32]={0},product[64]={0};
+    if(inq.ioctlOk&&inq.scsiStatus==0&&inq.dataLen>=36){BytesToAscii(inq.data,8,8,vendor,32);BytesToAscii(inq.data,16,16,product,64);}
+    BOOL ident=ContainsI(vendor,L"SONY")&&ContainsI(product,L"NWWM MEM AAD2");
+    ZeroMemory(cdb,sizeof(cdb));cdb[0]=0x00;ScsiResult tur=SendCdb(h,cdb,6,0);
+    ZeroMemory(cdb,sizeof(cdb));cdb[0]=0x25;ScsiResult cap=SendCdb(h,cdb,10,8);
+    ZeroMemory(cdb,sizeof(cdb));cdb[0]=0xFC;cdb[2]=0x03;cdb[8]=0x08;ScsiResult fw=SendCdb(h,cdb,12,8);
+    BOOL ok=ident&&IsSense3A00(&tur)&&IsSense3A00(&cap)&&IsKnownIssue1FwInfo(&fw);
+    LogF(L"FC/04 immediate preflight: identity=%s TUR3A00=%s CAP3A00=%s FC03-known=%s => %s",
+        ident?L"YES":L"NO",IsSense3A00(&tur)?L"YES":L"NO",IsSense3A00(&cap)?L"YES":L"NO",IsKnownIssue1FwInfo(&fw)?L"YES":L"NO",ok?L"PASS":L"FAIL");
+    return ok;
+}
+
+static void ResumeVerifiedUpdate(void) {
+    if(!(g_rootPackageIntact&&g_resumeEligible&&g_officialFirmwareVerified&&g_exactDevicePath[0])){
+        LogF(L"FC/04 resume locked: root-package=%d resume-eligible=%d official-fw-verified=%d path=%d",
+            g_rootPackageIntact,g_resumeEligible,g_officialFirmwareVerified,g_exactDevicePath[0]!=0);
+        MessageBoxW(g_hwnd,L"更新再開の条件が揃っていません。\n\n必要条件:\n・本体内MSFWUPGR.UPGが公式v2.0と完全一致\n・容量条件に重大な矛盾がない\n・Sony公式NW-E40X_V2_0J.exeをこのセッションで検証済み\n・現在もIssue #1状態",L"Update resume locked",MB_OK|MB_ICONWARNING);return;
+    }
+    if(MessageBoxW(g_hwnd,L"本体内のMSFWUPGR.UPGがSony公式v2.0と完全一致し、復旧条件を満たしています。\n\n次はSony純正Updaterと同じFC/04更新開始コマンドを1回だけ再送します。\n元の更新は一度失敗しているため、状態が悪化する可能性は残ります。\n\n更新再開を試しますか？",L"Experimental update resume",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES)return;
+    if(MessageBoxW(g_hwnd,L"最終確認です。\n\nFC/04送信後はUSBを抜かないでください。ツールは追加の書き込みコマンドを自動送信せず、USBの再認識だけを監視します。\n\n本当に実行しますか？",L"Final confirmation",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES)return;
+    if(!IsExactUsbPresentSilent()){LogF(L"FC/04 ABORT: exact USB device disappeared before preflight.");return;}
+    HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL);if(h==INVALID_HANDLE_VALUE){LogF(L"FC/04 ABORT: device open failed %lu",GetLastError());return;}
+    if(!RevalidateIssue1BeforeWrite(h)){CloseHandle(h);LogF(L"FC/04 ABORT: immediate preflight changed; command NOT sent.");MessageBoxW(g_hwnd,L"直前確認で状態が変化していたためFC/04は送信しませんでした。",L"Recovery aborted",MB_OK|MB_ICONWARNING);return;}
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 3: VERIFIED FC/04 UPDATE RESUME ===");
+    LogF(L"Safety gates passed. Sending exactly one no-data CDB: FC 00 04 00 00 00 00 00 00 00 00 00");
+    BYTE cdb[12]={0};cdb[0]=0xFC;cdb[2]=0x04;ScsiResult r=SendCdb(h,cdb,12,0);CloseHandle(h);ShowScsiResult(L"SONY FC/04 UPDATE START (gated)",&r);
+    if(!r.ioctlOk||r.scsiStatus!=0){LogF(L"FC/04 was NOT accepted. No further update command will be sent.");SetStatus(L"FC/04失敗 — 追加書き込みなし");SavePublicReport();return;}
+    LogF(L"FC/04 accepted with SCSI GOOD. Monitoring only; no further write/update commands will be sent.");
+    SetStatus(L"更新再開コマンド受理 — USBを抜かず再認識を待っています");
+    BOOL disappeared=FALSE,reappeared=FALSE;DWORD start=GetTickCount(),lastLog=0;
+    while(GetTickCount()-start<540000UL){DWORD elapsed=GetTickCount()-start;BOOL present=IsExactUsbPresentSilent();if(!present)disappeared=TRUE;if(disappeared&&present){reappeared=TRUE;break;}
+        if(elapsed-lastLog>=30000UL){lastLog=elapsed;LogF(L"Post-FC04 monitor: %lu sec, USB present=%s, disappeared-once=%s",elapsed/1000,present?L"YES":L"NO",disappeared?L"YES":L"NO");SaveLog();}
+        PumpMessages();Sleep(2000);}
+    if(reappeared){LogF(L"POST-UPDATE EVENT: NW-E405 USB disappeared and reappeared after FC/04.");SetStatus(L"NW-E405再認識 — 『診断する』で更新後状態を確認してください");MessageBoxW(g_hwnd,L"NW-E405が更新開始後に切断・再認識しました。\n\n次に『診断する』を押して、FW情報とメディア状態を確認してください。",L"Device reappeared",MB_OK|MB_ICONINFORMATION);}
+    else{LogF(L"POST-UPDATE TIMEOUT: no disappear/reappear cycle observed within the original updater timeout window (~9 min).");SetStatus(L"更新再開後タイムアウト — ログを保存しました");MessageBoxW(g_hwnd,L"約9分の監視中に正常な切断→再認識を確認できませんでした。\n追加コマンドは送っていません。公開レポートと非公開ログを確認してください。",L"Recovery timeout",MB_OK|MB_ICONWARNING);}
+    SavePublicReport();SaveLog();
+}
+
+static void RunRecoveryLadder(void) {
+    if(!(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch&&g_exactDevicePath[0])){
+        MessageBoxW(g_hwnd,L"先に『診断する』を実行してください。\nIssue #1の既知状態と一致した場合だけRecovery Ladderを開始できます。",L"Recovery locked",MB_OK|MB_ICONWARNING);return;
+    }
+    LogF(L"");LogF(L"=== RECOVERY LADDER START ===");
+    if(g_rootPackageIntact){
+        if(g_resumeEligible&&g_officialFirmwareVerified){ResumeVerifiedUpdate();return;}
+        if(g_resumeEligible&&!g_officialFirmwareVerified){LogF(L"Stage 3 ready except official Sony EXE has not been verified this session.");MessageBoxW(g_hwnd,L"本体内UPGは公式ハッシュと一致しています。\nFC/04再開の前に『純正FWを検証』からSony公式NW-E40X_V2_0J.exeを選んでください。",L"Verify official firmware first",MB_OK|MB_ICONINFORMATION);SavePublicReport();return;}
+        LogF(L"Root package is intact but the space/safety gate blocks FC/04 retry.");SavePublicReport();return;
+    }
+    if(!g_lba0Unreadable){RescueNoMedia();SavePublicReport();
+        if(g_rootPackageIntact&&g_resumeEligible&&g_officialFirmwareVerified){if(MessageBoxW(g_hwnd,L"救出したMSFWUPGR.UPGが公式v2.0と完全一致し、更新再開条件も通りました。\n続けてFC/04更新再開を試しますか？",L"Recovery Stage 3 available",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)ResumeVerifiedUpdate();return;}
+    }
+    if(g_lba0Unreadable){
+        if(MessageBoxW(g_hwnd,L"通常のREAD(10)経路ではLBA0も読めませんでした。\n\n次にSony MP3 File ManagerのNW-E405実機キャプチャ由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2 - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)QueryVendorDvId();
+        SavePublicReport();return;
+    }
+    LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();
 }
 
 static void VerifyFirmwareGui(void) {
@@ -1140,6 +1318,7 @@ static void RunDiagnostics(void) {
     g_noMediaRescueAvailable=FALSE; g_exactDevicePath[0]=0;
     g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
     g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
+    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");
@@ -1150,10 +1329,10 @@ static void RunDiagnostics(void) {
     SetStatus(L"診断中... USBを抜かないでください");
 
     LogF(L"%s", APP_TITLE);
-    LogF(L"Safety mode: READ-ONLY device diagnostics / backup research. FC/04 is not present.");
+    LogF(L"Diagnostic stage is READ-ONLY. Recovery Ladder may later unlock exactly one fixed A3 select or a gated FC/04 resume after explicit confirmation.");
     LogHostEnvironment();
     LogF(L"");
-    LogF(L"本体へのフォーマット、セクタ書込み、FW書込み、FC/04更新開始は実行しません。");
+    LogF(L"診断ボタン自体はフォーマット、セクタ書込み、FW書込み、FC/04更新開始を実行しません。");
     LogF(L"FC/03, FC/05, FC/09 are Sony read/query commands reconstructed from the original updater DLL.");
     LogF(L"");
 
@@ -1202,7 +1381,7 @@ static void RunDiagnostics(void) {
         LogF(L"A true force flash still needs a verified No-Media firmware transport or ROM/service protocol.");
         g_noMediaRescueAvailable = (g_exactDevicePath[0] != 0);
         if(g_noMediaRescueAvailable){
-            LogF(L"Read-only No-Media rescue is AVAILABLE: direct READ(10) LBA0 may now be tested.");
+            LogF(L"Recovery Ladder is AVAILABLE: direct READ(10) rescue is the first action stage.");
             if(g_rescue)EnableWindow(g_rescue,TRUE);
         }
     } else {
@@ -1212,12 +1391,14 @@ static void RunDiagnostics(void) {
     LogF(L"Official Japanese v2.0 package verified this session: %s", g_officialFirmwareVerified ? L"YES" : L"NO");
     LogF(L"");
     SaveMetadataBackup();
-    LogF(L"TXT journal: %s",g_logPath);
-    LogF(L"JSONL CDB trace: %s",g_jsonLogPath);
-    LogF(L"診断完了。Issue #1へTXTとJSONLを添付してください。");
+    SavePublicReport();
+    LogF(L"PUBLIC report: %s",g_publicReportPath);
+    LogF(L"PRIVATE TXT journal: %s",g_logPath);
+    LogF(L"PRIVATE JSONL CDB trace: %s",g_jsonLogPath);
+    LogF(L"GitHub Issue #1へはPUBLIC_REPORTだけを添付してください。生ログ/metadata/IMG/DvIDは非公開で扱ってください。");
     SaveLog();
     if(g_mediaBackupAvailable){SetStatus(L"診断完了 — 通常ストレージ保存が可能です");EnableWindow(g_backup,TRUE);}
-    else if(g_noMediaRescueAvailable){SetStatus(L"診断完了 — 『No Media救出』を試せます");EnableWindow(g_backup,FALSE);}
+    else if(g_noMediaRescueAvailable){SetStatus(L"診断完了 — 『リカバリー実行』を試せます");EnableWindow(g_backup,FALSE);}
     else {SetStatus(L"診断完了 — 追加の読み取り経路はまだ利用できません");EnableWindow(g_backup,FALSE);}
     EnableWindow(g_scan, TRUE);
 }
@@ -1269,7 +1450,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(title, WM_SETFONT, (WPARAM)fTitle, TRUE);
 
             HWND sub = CreateWindowW(L"STATIC",
-                L"Windows 7向け Recovery Lab / 本体側は読み取り専用。No Media救出・FW比較を行います。",
+                L"Windows 7向け Recovery Tool / 状態に応じて救出→vendor→更新再開を段階実行します。",
                 WS_CHILD | WS_VISIBLE, 20, 48, 720, 24, hwnd, NULL, NULL, NULL);
             SendMessageW(sub, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
@@ -1278,7 +1459,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 20, 80, 110, 36, hwnd, (HMENU)ID_SCAN, NULL, NULL);
             SendMessageW(g_scan, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
-            g_rescue = CreateWindowW(L"BUTTON", L"No Media救出",
+            g_rescue = CreateWindowW(L"BUTTON", L"リカバリー実行",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 140, 80, 125, 36, hwnd, (HMENU)ID_RESCUE, NULL, NULL);
             SendMessageW(g_rescue, WM_SETFONT, (WPARAM)fNormal, TRUE);
@@ -1325,7 +1506,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND:
             switch (LOWORD(wp)) {
                 case ID_SCAN: RunDiagnostics(); return 0;
-                case ID_RESCUE: RescueNoMedia(); return 0;
+                case ID_RESCUE: RunRecoveryLadder(); return 0;
                 case ID_BACKUP: BackupLogicalMedia(); return 0;
                 case ID_VERIFY_FW: VerifyFirmwareGui(); return 0;
                 case ID_COPY: CopyOutput(); return 0;

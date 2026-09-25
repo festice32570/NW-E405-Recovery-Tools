@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess, re, sys
 root=Path(__file__).resolve().parents[1]
-exe=root/'NW-E405-Recovery-Lab.exe'
+exe=root/'NW-E405-Recovery-Tool.exe'
 obj=root/'toolchain/llvm-mingw/bin/llvm-objdump'
 if not exe.exists():
     print('FAIL built PE missing'); sys.exit(1)

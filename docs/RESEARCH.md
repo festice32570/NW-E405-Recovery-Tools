@@ -123,3 +123,24 @@ Any future build that can write or start an update must require all of the follo
 7. Every outgoing CDB and result journaled before/after the operation where technically possible.
 
 Until a verified No-Media firmware transport or boot-ROM service protocol is known, the project should call itself a recovery **research/preflight** tool rather than claim guaranteed flashing.
+
+## v0.7 Recovery Ladder
+
+v0.7 combines the most useful findings from earlier releases instead of adding unrelated probes:
+
+- v0.3.1: original-updater-matched FC/03 transport parameters.
+- v0.5.1: corrected MSVC exception/control-flow audit, immediate intent/result logging, official package verification.
+- v0.6.1: gated No-Media LBA0 READ(10), FAT/MBR imaging, root UPG extraction and official hash comparison.
+- v0.7: action ladder using those results.
+
+### Stage 2: A3/A4
+
+The reference implementation in `tatsuyai713/sonydb-gui` documents a sequence captured from Sony MP3 File Manager talking to an NW-E405. A3 (`A3 00 00 00 00 00 00 BC 00 14 30 00`) with a fixed 20-byte `00 12 00...` DATA OUT selects an 18-byte Device-ID record. A4 (`A4 00 00 00 00 00 00 BC 00 12 3F 00`) reads the record. v0.7 hardcodes this one DATA OUT sequence and exposes no arbitrary outbound-SCSI interface.
+
+### Stage 3: FC/04 retry gate
+
+FC/04 is no longer treated as a generic recovery command. v0.7 makes it reachable only if the rescued FAT root contains an exact official Japanese v2.0 UPG, the inferred pre-copy free-space condition is not below Sony's ~3 MB requirement, the official updater EXE is verified in-session, the live device still matches the Issue #1 3A00 + known-FC03 state, and a second immediate preflight passes. Two user confirmations are required. The tool sends one no-data FC/04 and then monitors re-enumeration without sending another update/write command.
+
+### Privacy
+
+Full CDB JSONL, metadata, DvID, sectors, images and recovered UPG files are private evidence. v0.7 generates a separate public report containing only status flags and hashes.

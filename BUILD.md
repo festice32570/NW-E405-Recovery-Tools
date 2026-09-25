@@ -2,7 +2,7 @@
 
 Native Win32 C, 32-bit (`i686`) for Windows 7 x86/x64 (WoW64). No .NET, PowerShell or Python is required at runtime.
 
-v0.6.1-dev is a Windows 7-targeted read-only No-Media rescue/forensic build. It links miniz only to verify/extract a user-selected official Sony self-extracting updater on the PC.
+v0.7-dev is a Windows 7-targeted Recovery Ladder build. Diagnostics and imaging are read-only; the only DATA OUT is the fixed A3 Device-ID select sequence, and FC/04 is reachable only behind the verified-package/free-space/official-firmware/current-state gates. It links miniz only to verify/extract a user-selected official Sony self-extracting updater on the PC.
 
 ```sh
 i686-w64-mingw32-windres src/app.rc -O coff -o src/app.res
@@ -14,7 +14,7 @@ i686-w64-mingw32-clang \
   third_party/miniz/miniz.c third_party/miniz/miniz_tinfl.c \
   third_party/miniz/miniz_tdef.c third_party/miniz/miniz_zip.c \
   src/app.res -Ithird_party/miniz \
-  -o NW-E405-Recovery-Lab.exe \
+  -o NW-E405-Recovery-Tool.exe \
   -lsetupapi -lcfgmgr32 -lshell32 -lgdi32 -luser32 -lkernel32 -luuid \
   -lcomdlg32 -ladvapi32
 ```

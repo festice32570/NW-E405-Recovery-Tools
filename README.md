@@ -7,9 +7,59 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.6.1-dev — No Media Rescue / Forensic
+## GUI版 v0.7-dev — Recovery Ladder
 
-現在の推奨開発版は **`NW-E405-Recovery-Lab.exe` v0.6.1-dev** です。
+現在の推奨開発版は **`NW-E405-Recovery-Tool.exe` v0.7-dev** です。Windows 7 x64では32-bit Win32アプリとしてWoW64で動作し、.NET / PowerShell / Pythonは不要です。
+
+v0.7は「診断だけ」ではなく、Issue #1の既知状態と一致した場合に**段階的な復旧アクション**へ進みます。
+
+1. **Stage 1: No Media LBA rescue**
+   - `READ(10)` LBA0 / 512 bytesだけを直接試行
+   - 読めればFAT/MBRを解析してREAD(10)のみでIMG化
+   - `MSFWUPGR.UPG`をFATクラスタチェーンから抽出し、Sony公式v2.0 SHA-256と比較
+2. **Stage 2: Sony MP3FM A3/A4 Device-ID query**
+   - Stage 1でLBA0も読めない場合だけ提示
+   - NW-E405実機のSony MP3 File Manager通信キャプチャ由来の固定シーケンス
+   - A3: fixed 12-byte CDB + fixed 20-byte select DATA OUT (`00 12` + zeroes)
+   - A4: 18-byte DATA IN。先頭 `00 10` + 16-byte Device-ID recordを期待
+   - 生DvIDはPRIVATEファイルだけに保存。公開レポートにはSHA-256しか出しません
+3. **Stage 3: gated FC/04 update resume**
+   - FATから正規に抽出した本体内 `MSFWUPGR.UPG` が公式v2.0とSHA-256完全一致
+   - FAT空き容量から推定した更新前空きがSonyの約3 MB条件に矛盾しない
+   - Sony公式 `NW-E40X_V2_0J.exe` を同セッションで検証済み
+   - 現在もIssue #1の `VID/PID + SONY/NWWM + TUR 3A00 + CAP 3A00 + known FC03` 状態
+   - 上記を送信直前にも再確認
+   - 二重確認後に純正Updaterと同じ**no-data FC/04を1回だけ**送信
+   - 以後は追加のwrite/update commandを送らず、USB切断→再認識だけを約9分監視
+
+### 公開/非公開ログ
+
+GitHub Issueへ貼るのは **`NW-E405_PUBLIC_REPORT_*.txt` だけ**を推奨します。これはRaw DvID、音楽データ、IMGセクタ、vendor response本文を含みません。
+
+次はPRIVATE扱いです。公開Issueへそのまま貼らないでください。
+
+- `NW-E405_diag_*.txt`
+- `NW-E405_trace_*.jsonl`
+- `NW-E405_metadata_*.bin`
+- `NW-E405_DvID_PRIVATE_*.bin`
+- `NW-E405_LBA0_*.bin`
+- `NW-E405_rescue_*.img` / `.partial`
+- 抽出したUPG
+
+### v0.7で許可している本体向けアクション
+
+- DATA IN / no-data診断コマンド
+- READ(10)
+- **固定A3 select DATA OUT 1種類だけ**
+- 条件をすべて満たした場合の**FC/04 update-start 1回だけ**
+
+標準SCSI `WRITE(10/12)`、WRITE BUFFER、フォーマット、パーティション書き込み、任意DATA OUT、任意vendor writeは実装しません。
+
+---
+
+## 過去版: v0.6.1-dev — No Media Rescue / Forensic
+
+v0.6.1-devはNo Media救出経路を確立した読み取り専用の過去版です。現在はv0.7-devを推奨します。
 
 > **重要:** v0.6.1-devはまだ「強制フラッシュ版」ではありません。MSVCの例外テーブルまで含めて純正Updaterを再監査した結果、`CopyFileA` が失敗した場合は例外ハンドラで `SendFWUpdateCommand` が中止され、`FC/04` へ進まないことを確認しました。一方、純正GUIが99%待機へ入るのは `SendFWUpdateCommand` が成功した後です。Issue #1ではUPGコピーとFC/04開始までは成功し、その後の本体側更新または再起動・再列挙で失敗した可能性が高いと見ています。v0.4-devの単純なFC/04再送は、この失敗を繰り返す可能性があるため撤回したままです。
 
