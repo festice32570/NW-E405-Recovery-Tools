@@ -11,3 +11,4 @@ NW-E405_trace_*.jsonl
 NW-E405_metadata_*.bin
 NW-E405_storage_*.img
 NW-E405_storage_*.img.partial
+build/

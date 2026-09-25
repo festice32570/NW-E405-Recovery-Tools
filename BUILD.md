@@ -2,7 +2,7 @@
 
 Native Win32 C, 32-bit (`i686`) for Windows 7 x86/x64 (WoW64). No .NET, PowerShell or Python is required at runtime.
 
-v0.5-dev is a read-only device-side forensic/preflight build. It links miniz only to verify/extract a user-selected official Sony self-extracting updater on the PC.
+v0.6-dev is a Windows 7-targeted read-only No-Media rescue/forensic build. It links miniz only to verify/extract a user-selected official Sony self-extracting updater on the PC.
 
 ```sh
 i686-w64-mingw32-windres src/app.rc -O coff -o src/app.res
@@ -26,7 +26,7 @@ The manifest requests administrator privileges because Windows may require them 
 ```sh
 python3 tests/run_tests.py
 python3 tests/validate_release.py
-python3 tools/original_updater_audit.py /path/to/FWUpdaterCom.dll
+python3 tools/original_updater_audit.py /path/to/FWUpdaterCom.dll /path/to/FWUpdater.exe
 ```
 
-The original-updater audit is pinned to the exact analyzed `FWUpdaterCom.dll` SHA-256 and verifies the low-free-space control-flow finding before relying on it.
+The original-updater audit is pinned to the exact analyzed `FWUpdaterCom.dll` and `FWUpdater.exe` SHA-256 values. It verifies the MSVC exception-handler path for copy failure and separately pins the post-start 99% progress/timer behavior.

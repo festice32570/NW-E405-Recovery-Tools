@@ -21,7 +21,7 @@ Japanese Sony package:
 
 The official updater INI specifies `Version=2.0.01.0`, `FWInfoSize=8`, `FWConfig=20`, `ClassifyType=3`.
 
-The official update documentation requires approximately 3 MB free on the Walkman before updating. The UPG itself is about 2.13 MB. More importantly, the original DLL explicitly handles `ERROR_DISK_FULL` from `CopyFileA` but still converges on the `FC/04` update-start block. Low free space is therefore not just a scratch-space concern; it is a plausible direct trigger for starting update from an invalid package state.
+The official update documentation requires approximately 3 MB free on the Walkman before updating. The UPG itself is 2,131,380 bytes (about 2.03 MiB). Re-auditing the original DLL with its MSVC C++ exception metadata shows that a `CopyFileA` failure is raised into the `SendFWUpdateCommand` catch handler and returns an error before `FC/04`; the earlier straight-line-control-flow interpretation was incorrect. Because Issue #1 reached the GUI's post-start 99% wait, the UPG copy likely succeeded. Low free space can still be relevant if there was enough space to store the UPG but less than Sony's ~3 MB requirement, leaving insufficient device-side work space. That remains a hypothesis, not a documented Sony root cause.
 
 Official Sony support pages:
 
@@ -39,18 +39,21 @@ Therefore an update that reaches 99% and then times out is not evidence of a 99%
 
 ## SendFWUpdateCommand flow
 
-Reverse engineered flow in `FWUpdaterCom.dll`:
+Reverse engineered flow in `FWUpdaterCom.dll`, including the MSVC exception tables:
 
-1. Build `<drive>:\\MSFWUPGR.UPG`.
+1. Build `<drive>:\MSFWUPGR.UPG`.
 2. `CopyFileA` the selected official UPG to that path.
-3. If `CopyFileA` fails, record an error. The DLL explicitly recognizes `ERROR_DISK_FULL (0x70)`.
-4. **Both the CopyFile success path and the handled failure path converge on the same `FC/04` block.**
-5. Send Sony vendor command `FC/04` as a 12-byte CDB with no data payload.
-6. Return to the UI, which then waits for the Walkman to restart/reappear.
+3. If `CopyFileA` fails, obtain `GetLastError()` (including explicit handling of `ERROR_DISK_FULL / 0x70`) and call an internal exception helper.
+4. The helper reaches `RaiseException`. The `SendFWUpdateCommand` FuncInfo (`0x1000CF30`) maps the exception to catch handler `0x10005287`.
+5. That catch handler returns a continuation at `0x1000529A`, which performs cleanup/error return. It bypasses the `FC/04` builder at `0x10005222`.
+6. On the normal success path, send Sony vendor command `FC/04` as a 12-byte CDB with no data payload.
+7. Return success to the UI, which then waits for the Walkman to restart/reappear.
 
-`FC/04` is therefore an update-start command, **not a PC-side firmware transport**.
+`FC/04` is therefore an update-start command, **not a PC-side firmware transport**. A failed PC-side package copy does not normally reach it.
 
-For Issue #1, blindly re-sending FC/04 is unsafe. The original DLL can reach FC/04 even when CopyFile reports disk full, so the failed run may have started device-side update with a missing, stale, or incomplete package state. The exact on-device file condition is not recoverable through the current `3A00` mass-storage path.
+For Issue #1, reaching the GUI's 99% wait is important evidence: that wait occurs only after `SendFWUpdateCommand` returned success. This strongly suggests the original UPG copy and update-start stage completed far enough for the UI to begin its post-start wait. The failure is therefore more likely in device-side update processing, reboot, or re-enumeration than in the visible PC-side file copy itself.
+
+Blindly re-sending `FC/04` is still unsafe. The first update-start may already have partially modified firmware or metadata, and the exact on-device package/update state is not recoverable through the current `3A00` mass-storage path.
 
 ## Windows 7 x64 assessment
 
@@ -58,7 +61,7 @@ The 2005 firmware updater was released for Windows 98/Me/2000/XP-era systems. So
 
 However, the updater does not simply reject Windows 7. Its internal OS classifier maps NT 6.x into the same high-level backend selection path used by later NT systems. User group membership also affects backend selection; an Administrator can be routed to the direct-drive SCSI backend.
 
-So Windows 7 x64 was an unsupported and risky environment, but it is not sufficient by itself to explain this failure. The original updater could still reach the package-copy and `FC/04` stage. The low-free-space condition remains the stronger direct failure hypothesis, with Windows 7 x64 as a possible contributing factor in re-enumeration/legacy behavior.
+So Windows 7 x64 was an unsupported and risky environment, but it is not sufficient by itself to explain this failure. The 99% evidence suggests the updater reached and returned successfully from the package-copy/update-start stage. Windows 7 x64 remains a plausible contributing factor in post-update re-enumeration or legacy-driver behavior. Low free space is also plausible, specifically the range where the 2.13 MB package fits but Sony's recommended ~3 MB working-space requirement is not met; this remains an inference rather than a proven root cause.
 
 ## UPG structure and wrong-model protection
 
@@ -83,6 +86,15 @@ The large payload regions have very high entropy. They may be encrypted, compres
 - `FC/09`: GetProductInfo-shaped data-in query using the INI signature `roga`, allocation length 24.
 
 The current main branch does not contain `FC/04`, SCSI DATA OUT, or standard SCSI write opcodes.
+
+
+## v0.6 No-Media logical rescue
+
+`READ CAPACITY(10)` returning `3A00` does not prove that every `READ(10)` must fail. v0.6 therefore performs one explicitly bounded experiment on an exact Issue #1 state match: `READ(10)`, LBA 0, one 512-byte block. If that succeeds, it treats the result as evidence that the logical media path is partly reachable despite the capacity command failure.
+
+The tool then parses FAT12/16/32 BPB data directly or follows an MBR partition start to a FAT boot sector. A derived geometry is accepted only when the BPB is internally plausible and the resulting image size is <= 2 GiB. Bulk rescue remains READ(10)-only.
+
+After imaging, the tool first extracts root `MSFWUPGR.UPG` by following the FAT cluster chain. If directory/FAT metadata is damaged, it also scans the raw image for the official UPG header tuple (`UPGR_FMT`, `SONY`, `00100000`) and cuts a 2,131,380-byte candidate for SHA-256 comparison. This is intended to distinguish a complete official package from a damaged/stale package without writing anything to the player.
 
 ## Force-flash research paths
 

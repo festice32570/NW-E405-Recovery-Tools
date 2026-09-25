@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Lab v0.5-dev"
+#define APP_TITLE L"NW-E405 Recovery Lab v0.6-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -21,6 +21,7 @@
 #define ID_GITHUB 1004
 #define ID_BACKUP 1005
 #define ID_VERIFY_FW 1006
+#define ID_RESCUE 1007
 #define ID_OUTPUT 1101
 #define ID_STATUS 1102
 
@@ -29,6 +30,7 @@ static HWND g_output = NULL;
 static HWND g_status = NULL;
 static HWND g_scan = NULL;
 static HWND g_backup = NULL;
+static HWND g_rescue = NULL;
 static HANDLE g_liveLog = INVALID_HANDLE_VALUE;
 static HANDLE g_jsonLog = INVALID_HANDLE_VALUE;
 static WCHAR g_jsonLogPath[MAX_PATH] = {0};
@@ -45,6 +47,13 @@ static LONG g_cdbSequence = 0;
 static WCHAR g_logPath[MAX_PATH] = {0};
 static WCHAR g_exeDir[MAX_PATH] = {0};
 static BOOL g_exactUsbPresent = FALSE;
+static BOOL g_issue1TurNoMedia = FALSE;
+static BOOL g_issue1CapNoMedia = FALSE;
+static BOOL g_issue1FwInfoMatch = FALSE;
+static BOOL g_officialFirmwareVerified = FALSE;
+static WCHAR g_verifiedUpgPath[MAX_PATH] = {0};
+static WCHAR g_exactDevicePath[1024] = {0};
+static BOOL g_noMediaRescueAvailable = FALSE;
 
 typedef struct {
     SCSI_PASS_THROUGH_DIRECT sptd;
@@ -65,12 +74,31 @@ typedef struct {
     BYTE targetId;
     DWORD requestedDataLen;
     DWORD elapsedMs;
+    LONG traceSeq;
 } ScsiResult;
 
+typedef struct {
+    BOOL valid;
+    DWORD volumeStartLba;
+    DWORD bytesPerSector;
+    DWORD sectorsPerCluster;
+    DWORD reservedSectors;
+    DWORD fatCount;
+    DWORD rootEntryCount;
+    DWORD totalSectors;
+    DWORD sectorsPerFat;
+    DWORD rootDirSectors;
+    DWORD firstDataSector;
+    DWORD rootCluster;
+    int fatType;
+} FatLayout;
+
+static void TraceCdbIntentJson(const ScsiResult *r);
 static void TraceCdbJson(const ScsiResult *r);
 static BOOL StartSessionLogs(void);
 static void CloseSessionLogs(void);
 static void SaveMetadataBackup(void);
+static BOOL SaveLog(void);
 
 static void PumpMessages(void) {
     MSG msg;
@@ -131,11 +159,13 @@ static BOOL StartSessionLogs(void) {
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
     g_jsonLog = CreateFileW(g_jsonLogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
-    if (g_liveLog != INVALID_HANDLE_VALUE) {
-        DWORD wr=0; BYTE bom[3]={0xEF,0xBB,0xBF}; WriteFile(g_liveLog,bom,3,&wr,NULL); FlushFileBuffers(g_liveLog);
+    if (g_liveLog == INVALID_HANDLE_VALUE || g_jsonLog == INVALID_HANDLE_VALUE) {
+        CloseSessionLogs();
+        return FALSE;
     }
+    { DWORD wr=0; BYTE bom[3]={0xEF,0xBB,0xBF}; WriteFile(g_liveLog,bom,3,&wr,NULL); FlushFileBuffers(g_liveLog); }
     g_cdbSequence = 0;
-    return g_liveLog != INVALID_HANDLE_VALUE && g_jsonLog != INVALID_HANDLE_VALUE;
+    return TRUE;
 }
 
 static void SetStatus(const WCHAR *s) {
@@ -219,6 +249,8 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
     pkt.sptd.SenseInfoOffset = offsetof(SPTDWB, sense);
     CopyMemory(pkt.sptd.Cdb, cdb, cdbLen);
 
+    r.traceSeq = InterlockedIncrement(&g_cdbSequence);
+    TraceCdbIntentJson(&r);
     DWORD ret = 0;
     DWORD started = GetTickCount();
     BOOL ok = DeviceIoControl(h, IOCTL_SCSI_PASS_THROUGH_DIRECT,
@@ -241,6 +273,19 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
     return SendCdbEx(h, cdb, cdbLen, dataLen, 0);
 }
 
+static void TraceCdbIntentJson(const ScsiResult *r) {
+    if (!r || g_jsonLog == INVALID_HANDLE_VALUE) return;
+    WCHAR cdbHex[96]={0}; char cdbA[192]={0}, line[1024];
+    BytesToHex(r->cdb, r->cdbLen, cdbHex, 96);
+    WideCharToMultiByte(CP_UTF8,0,cdbHex,-1,cdbA,sizeof(cdbA),NULL,NULL);
+    SYSTEMTIME st; GetLocalTime(&st);
+    int n=_snprintf(line,sizeof(line)-1,
+        "{\"seq\":%ld,\"phase\":\"intent\",\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu}\r\n",
+        r->traceSeq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
+        r->targetId,cdbA,r->requestedDataLen?"IN":"NONE",r->requestedDataLen);
+    if (n>0) { DWORD wr=0; WriteFile(g_jsonLog,line,(DWORD)n,&wr,NULL); FlushFileBuffers(g_jsonLog); }
+}
+
 static void TraceCdbJson(const ScsiResult *r) {
     if (!r || g_jsonLog == INVALID_HANDLE_VALUE) return;
     WCHAR cdbHex[96]={0}, senseHex[160]={0}, dataHex[600]={0};
@@ -253,10 +298,9 @@ static void TraceCdbJson(const ScsiResult *r) {
     WideCharToMultiByte(CP_UTF8,0,cdbHex,-1,cdbA,sizeof(cdbA),NULL,NULL);
     WideCharToMultiByte(CP_UTF8,0,senseHex,-1,senseA,sizeof(senseA),NULL,NULL);
     WideCharToMultiByte(CP_UTF8,0,dataHex,-1,dataA,sizeof(dataA),NULL,NULL);
-    LONG seq=InterlockedIncrement(&g_cdbSequence);
     int n=_snprintf(line,sizeof(line)-1,
-        "{\"seq\":%ld,\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu,\"ioctl_ok\":%s,\"win32\":%lu,\"scsi_status\":%u,\"sense\":\"%s\",\"data\":\"%s\",\"elapsed_ms\":%lu}\r\n",
-        seq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
+        "{\"seq\":%ld,\"phase\":\"result\",\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu,\"ioctl_ok\":%s,\"win32\":%lu,\"scsi_status\":%u,\"sense\":\"%s\",\"data\":\"%s\",\"elapsed_ms\":%lu}\r\n",
+        r->traceSeq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
         r->targetId,cdbA,r->requestedDataLen?"IN":"NONE",r->requestedDataLen,r->ioctlOk?"true":"false",r->winErr,r->scsiStatus,senseA,dataA,r->elapsedMs);
     if (n>0) { DWORD wr=0; WriteFile(g_jsonLog,line,(DWORD)n,&wr,NULL); FlushFileBuffers(g_jsonLog); }
 }
@@ -277,6 +321,17 @@ static void ShowScsiResult(const WCHAR *name, const ScsiResult *r) {
         LogF(L"Data: %s", hex);
     }
     LogF(L"");
+}
+
+static BOOL IsSense3A00(const ScsiResult *r) {
+    return r && r->ioctlOk && r->scsiStatus == 0x02 &&
+           ((r->sense[2] & 0x0F) == 0x02) && r->sense[12] == 0x3A && r->sense[13] == 0x00;
+}
+
+static BOOL IsKnownIssue1FwInfo(const ScsiResult *r) {
+    static const BYTE known[8] = {0x01,0x00,0x0D,0x00,0x20,0x02,0x00,0x00};
+    return r && r->ioctlOk && r->scsiStatus == 0x00 && r->dataLen >= 8 &&
+           memcmp(r->data, known, sizeof(known)) == 0;
 }
 
 static BOOL ContainsI(const WCHAR *hay, const WCHAR *needle) {
@@ -628,7 +683,11 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
 
     LogF(L"  Expected SCSI identity found.");
     LogF(L"  USB parent mapping to VID_054C&PID_01FB: %s", exactMapped ? L"YES" : L"NO");
-    if (exactMapped) { g_metaInquiryLen = inq.dataLen > 96 ? 96 : inq.dataLen; CopyMemory(g_metaInquiry, inq.data, g_metaInquiryLen); }
+    if (exactMapped) {
+        g_metaInquiryLen = inq.dataLen > 96 ? 96 : inq.dataLen;
+        CopyMemory(g_metaInquiry, inq.data, g_metaInquiryLen);
+        lstrcpynW(g_exactDevicePath, path, 1024);
+    }
     LogF(L"");
 
     ShowScsiResult(L"SCSI INQUIRY", &inq);
@@ -637,6 +696,7 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
     cdb[0] = 0x00;
     ScsiResult tur = SendCdb(h, cdb, 6, 0);
     ShowScsiResult(L"TEST UNIT READY", &tur);
+    if (exactMapped && IsSense3A00(&tur)) g_issue1TurNoMedia = TRUE;
 
     ZeroMemory(cdb, sizeof(cdb));
     cdb[0] = 0x03;
@@ -648,6 +708,7 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
     cdb[0] = 0x25;
     ScsiResult cap = SendCdb(h, cdb, 10, 8);
     ShowScsiResult(L"READ CAPACITY(10)", &cap);
+    if (exactMapped && IsSense3A00(&cap)) g_issue1CapNoMedia = TRUE;
     if (cap.ioctlOk && cap.scsiStatus == 0 && cap.dataLen >= 8) {
         uint32_t last = ((uint32_t)cap.data[0] << 24) | ((uint32_t)cap.data[1] << 16) |
                         ((uint32_t)cap.data[2] << 8) | cap.data[3];
@@ -675,6 +736,7 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
             LogF(L"RESULT: Sony vendor-command processor responded. Read-only recovery research can continue.");
             g_metaFc03Len = sonyInfo.dataLen > 8 ? 8 : sonyInfo.dataLen;
             CopyMemory(g_metaFc03, sonyInfo.data, g_metaFc03Len);
+            if (IsKnownIssue1FwInfo(&sonyInfo)) g_issue1FwInfoMatch = TRUE;
         } else {
             LogF(L"RESULT: Sony vendor read command did not complete successfully.");
         }
@@ -784,10 +846,218 @@ static BOOL Read10Chunk(HANDLE h, DWORD lba, WORD blocks, BYTE *buf, DWORD bytes
     BYTE *cdb=pkt.sptd.Cdb; cdb[0]=0x28;
     cdb[2]=(BYTE)(lba>>24); cdb[3]=(BYTE)(lba>>16); cdb[4]=(BYTE)(lba>>8); cdb[5]=(BYTE)lba;
     cdb[7]=(BYTE)(blocks>>8); cdb[8]=(BYTE)blocks;
+    if (summary) {
+        ZeroMemory(summary,sizeof(*summary)); summary->opened=TRUE; summary->cdbLen=10; summary->targetId=0;
+        summary->requestedDataLen=bytes; CopyMemory(summary->cdb,cdb,10);
+        summary->traceSeq=InterlockedIncrement(&g_cdbSequence); TraceCdbIntentJson(summary);
+    }
     DWORD ret=0,started=GetTickCount();
     BOOL ok=DeviceIoControl(h,IOCTL_SCSI_PASS_THROUGH_DIRECT,&pkt,sizeof(pkt),&pkt,sizeof(pkt),&ret,NULL);
-    if (summary) { ZeroMemory(summary,sizeof(*summary)); summary->opened=TRUE; summary->ioctlOk=ok; summary->winErr=ok?0:GetLastError(); summary->scsiStatus=pkt.sptd.ScsiStatus; summary->elapsedMs=GetTickCount()-started; summary->cdbLen=10; summary->targetId=0; summary->requestedDataLen=bytes; CopyMemory(summary->cdb,cdb,10); CopyMemory(summary->sense,pkt.sense,18); }
+    if (summary) { summary->ioctlOk=ok; summary->winErr=ok?0:GetLastError(); summary->scsiStatus=pkt.sptd.ScsiStatus; summary->elapsedMs=GetTickCount()-started; CopyMemory(summary->sense,pkt.sense,18); }
     return ok && pkt.sptd.ScsiStatus==0;
+}
+
+
+static WORD Le16(const BYTE *p) { return (WORD)(p[0] | ((WORD)p[1] << 8)); }
+static DWORD Le32(const BYTE *p) { return (DWORD)p[0] | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24); }
+static BOOL IsPowerOfTwoDword(DWORD v) { return v && ((v & (v - 1)) == 0); }
+
+static BOOL ParseFatBootSector(const BYTE sec[512], DWORD volumeStartLba, FatLayout *out) {
+    if (!sec || !out) return FALSE;
+    ZeroMemory(out, sizeof(*out));
+    if (sec[510] != 0x55 || sec[511] != 0xAA) return FALSE;
+    DWORD bps = Le16(sec + 11);
+    DWORD spc = sec[13];
+    DWORD reserved = Le16(sec + 14);
+    DWORD fats = sec[16];
+    DWORD rootEntries = Le16(sec + 17);
+    DWORD total = Le16(sec + 19); if (!total) total = Le32(sec + 32);
+    DWORD spf = Le16(sec + 22); if (!spf) spf = Le32(sec + 36);
+    if (bps != 512 || !IsPowerOfTwoDword(spc) || spc > 128 || reserved == 0 ||
+        fats == 0 || fats > 2 || total < 32 || spf == 0) return FALSE;
+    DWORD rootDirSectors = ((rootEntries * 32u) + (bps - 1u)) / bps;
+    uint64_t firstData64 = (uint64_t)reserved + (uint64_t)fats * spf + rootDirSectors;
+    if (firstData64 >= total || firstData64 > 0xFFFFFFFFu) return FALSE;
+    DWORD firstData = (DWORD)firstData64;
+    DWORD dataSectors = total - firstData;
+    DWORD clusters = dataSectors / spc;
+    int type = (clusters < 4085) ? 12 : ((clusters < 65525) ? 16 : 32);
+    DWORD rootCluster = (type == 32) ? Le32(sec + 44) : 0;
+    if (type == 32 && rootCluster < 2) return FALSE;
+    out->valid = TRUE; out->volumeStartLba = volumeStartLba; out->bytesPerSector = bps;
+    out->sectorsPerCluster = spc; out->reservedSectors = reserved; out->fatCount = fats;
+    out->rootEntryCount = rootEntries; out->totalSectors = total; out->sectorsPerFat = spf;
+    out->rootDirSectors = rootDirSectors; out->firstDataSector = firstData;
+    out->rootCluster = rootCluster; out->fatType = type;
+    return TRUE;
+}
+
+static BOOL ReadHostAt(HANDLE h, uint64_t offset, void *buf, DWORD len) {
+    LARGE_INTEGER li; li.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) return FALSE;
+    BYTE *p = (BYTE*)buf; DWORD total = 0;
+    while (total < len) { DWORD got = 0; if (!ReadFile(h, p + total, len - total, &got, NULL) || !got) return FALSE; total += got; }
+    return TRUE;
+}
+
+static BOOL Sha256FileHexLocal(const WCHAR *path, WCHAR out[65]) {
+    out[0] = 0;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    HCRYPTPROV prov = 0; HCRYPTHASH hash = 0; BOOL ok = FALSE;
+    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) { CloseHandle(f); return FALSE; }
+    if (!CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) { CryptReleaseContext(prov,0); CloseHandle(f); return FALSE; }
+    BYTE *buf = (BYTE*)VirtualAlloc(NULL, 1024*1024, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (buf) {
+        for (;;) { DWORD got=0; if (!ReadFile(f,buf,1024*1024,&got,NULL)) break; if (!got) { ok=TRUE; break; } if (!CryptHashData(hash,buf,got,0)) { ok=FALSE; break; } }
+        VirtualFree(buf,0,MEM_RELEASE);
+    }
+    if (ok) {
+        BYTE hv[32]; DWORD cb=32;
+        if (!CryptGetHashParam(hash,HP_HASHVAL,hv,&cb,0) || cb!=32) ok=FALSE;
+        else { static const WCHAR hx[]=L"0123456789abcdef"; for(int i=0;i<32;i++){out[i*2]=hx[hv[i]>>4];out[i*2+1]=hx[hv[i]&15];} out[64]=0; }
+    }
+    CryptDestroyHash(hash); CryptReleaseContext(prov,0); CloseHandle(f); return ok;
+}
+
+static BOOL FatReadNextCluster(HANDLE img, const FatLayout *f, DWORD cluster, DWORD *next) {
+    uint64_t fatBase = ((uint64_t)f->volumeStartLba + f->reservedSectors) * 512ULL;
+    BYTE b[4] = {0}; DWORD v = 0;
+    if (f->fatType == 12) {
+        uint64_t off = fatBase + cluster + cluster/2;
+        if (!ReadHostAt(img, off, b, 2)) return FALSE;
+        v = Le16(b); v = (cluster & 1) ? (v >> 4) : (v & 0x0FFF);
+    } else if (f->fatType == 16) {
+        if (!ReadHostAt(img, fatBase + (uint64_t)cluster*2, b, 2)) return FALSE;
+        v = Le16(b);
+    } else {
+        if (!ReadHostAt(img, fatBase + (uint64_t)cluster*4, b, 4)) return FALSE;
+        v = Le32(b) & 0x0FFFFFFF;
+    }
+    *next = v; return TRUE;
+}
+
+static BOOL FatIsEoc(const FatLayout *f, DWORD c) {
+    if (f->fatType == 12) return c >= 0x0FF8;
+    if (f->fatType == 16) return c >= 0xFFF8;
+    return c >= 0x0FFFFFF8;
+}
+
+static uint64_t FatClusterOffset(const FatLayout *f, DWORD cluster) {
+    uint64_t lba = (uint64_t)f->volumeStartLba + f->firstDataSector +
+        (uint64_t)(cluster - 2) * f->sectorsPerCluster;
+    return lba * 512ULL;
+}
+
+static BOOL FindRootUpg(HANDLE img, const FatLayout *f, DWORD *firstCluster, DWORD *fileSize) {
+    static const BYTE target[11] = {'M','S','F','W','U','P','G','R','U','P','G'};
+    BYTE sec[512];
+    if (f->fatType != 32) {
+        DWORD rootStart = f->volumeStartLba + f->reservedSectors + f->fatCount * f->sectorsPerFat;
+        for (DWORD s=0; s<f->rootDirSectors; ++s) {
+            if (!ReadHostAt(img, (uint64_t)(rootStart+s)*512ULL, sec, 512)) return FALSE;
+            for (int o=0;o<512;o+=32) {
+                BYTE *e=sec+o; if(e[0]==0x00)return FALSE; if(e[0]==0xE5 || e[11]==0x0F)continue;
+                if(!memcmp(e,target,11)){*firstCluster=Le16(e+26);*fileSize=Le32(e+28);return TRUE;}
+            }
+        }
+        return FALSE;
+    }
+    DWORD cluster=f->rootCluster; DWORD guard=0; DWORD clusterBytes=f->sectorsPerCluster*512;
+    BYTE *buf=(BYTE*)VirtualAlloc(NULL,clusterBytes,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE); if(!buf)return FALSE;
+    BOOL found=FALSE;
+    while(cluster>=2 && !FatIsEoc(f,cluster) && guard++<131072){
+        if(!ReadHostAt(img,FatClusterOffset(f,cluster),buf,clusterBytes))break;
+        for(DWORD o=0;o<clusterBytes;o+=32){BYTE *e=buf+o;if(e[0]==0x00)goto done;if(e[0]==0xE5||e[11]==0x0F)continue;
+            if(!memcmp(e,target,11)){*firstCluster=((DWORD)Le16(e+20)<<16)|Le16(e+26);*fileSize=Le32(e+28);found=TRUE;goto done;}}
+        DWORD n=0;if(!FatReadNextCluster(img,f,cluster,&n))break;cluster=n;
+    }
+done: VirtualFree(buf,0,MEM_RELEASE);return found;
+}
+
+static BOOL ExtractRootUpgFromImage(const WCHAR *imagePath, const FatLayout *f, WCHAR outPath[MAX_PATH], WCHAR hashOut[65]) {
+    HANDLE img=CreateFileW(imagePath,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(img==INVALID_HANDLE_VALUE)return FALSE;
+    DWORD cluster=0,size=0;
+    if(!FindRootUpg(img,f,&cluster,&size) || cluster<2 || size==0 || size>16*1024*1024){CloseHandle(img);return FALSE;}
+    _snwprintf(outPath,MAX_PATH-1,L"%s\\NW-E405_recovered_MSFWUPGR_%s.UPG",g_exeDir,g_sessionStem);
+    HANDLE out=CreateFileW(outPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
+    if(out==INVALID_HANDLE_VALUE){CloseHandle(img);return FALSE;}
+    DWORD clusterBytes=f->sectorsPerCluster*512; BYTE *buf=(BYTE*)VirtualAlloc(NULL,clusterBytes,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    BOOL ok=buf!=NULL; DWORD remain=size,guard=0;
+    while(ok && remain && cluster>=2 && !FatIsEoc(f,cluster) && guard++<131072){
+        if(!ReadHostAt(img,FatClusterOffset(f,cluster),buf,clusterBytes)){ok=FALSE;break;}
+        DWORD n=remain<clusterBytes?remain:clusterBytes,wr=0;if(!WriteFile(out,buf,n,&wr,NULL)||wr!=n){ok=FALSE;break;}remain-=n;
+        if(!remain)break;DWORD next=0;if(!FatReadNextCluster(img,f,cluster,&next)){ok=FALSE;break;}cluster=next;
+    }
+    if(remain)ok=FALSE; if(buf)VirtualFree(buf,0,MEM_RELEASE); FlushFileBuffers(out);CloseHandle(out);CloseHandle(img);
+    if(!ok){LogF(L"FAT extraction of MSFWUPGR.UPG failed; partial file retained: %s",outPath);return FALSE;}
+    if(!Sha256FileHexLocal(outPath,hashOut))hashOut[0]=0;
+    return TRUE;
+}
+
+static BOOL ExtractContiguousUpgCandidate(const WCHAR *imagePath, uint64_t offset, WCHAR outPath[MAX_PATH], WCHAR hashOut[65]) {
+    const DWORD size=2131380u;
+    HANDLE in=CreateFileW(imagePath,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);if(in==INVALID_HANDLE_VALUE)return FALSE;
+    _snwprintf(outPath,MAX_PATH-1,L"%s\\NW-E405_raw_UPG_candidate_%s.UPG",g_exeDir,g_sessionStem);
+    HANDLE out=CreateFileW(outPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);if(out==INVALID_HANDLE_VALUE){CloseHandle(in);return FALSE;}
+    BYTE *buf=(BYTE*)VirtualAlloc(NULL,1024*1024,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);BOOL ok=buf!=NULL;DWORD remain=size;uint64_t pos=offset;
+    while(ok&&remain){DWORD n=remain>1024*1024?1024*1024:remain;if(!ReadHostAt(in,pos,buf,n)){ok=FALSE;break;}DWORD wr=0;if(!WriteFile(out,buf,n,&wr,NULL)||wr!=n){ok=FALSE;break;}pos+=n;remain-=n;}
+    if(buf)VirtualFree(buf,0,MEM_RELEASE);FlushFileBuffers(out);CloseHandle(out);CloseHandle(in);if(!ok)return FALSE;
+    if(!Sha256FileHexLocal(outPath,hashOut))hashOut[0]=0;return TRUE;
+}
+
+static BOOL ScanImageForUpg(const WCHAR *imagePath, WCHAR outPath[MAX_PATH], WCHAR hashOut[65], uint64_t *foundOffset) {
+    HANDLE h=CreateFileW(imagePath,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_SEQUENTIAL_SCAN,NULL);if(h==INVALID_HANDLE_VALUE)return FALSE;
+    LARGE_INTEGER sz;if(!GetFileSizeEx(h,&sz)){CloseHandle(h);return FALSE;}
+    const DWORD chunk=1024*1024,overlap=0x40;BYTE *buf=(BYTE*)VirtualAlloc(NULL,chunk+overlap,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);if(!buf){CloseHandle(h);return FALSE;}
+    uint64_t base=0;DWORD carry=0;BOOL found=FALSE;uint64_t off=0;
+    while(base<(uint64_t)sz.QuadPart){LARGE_INTEGER li;li.QuadPart=(LONGLONG)base;SetFilePointerEx(h,li,NULL,FILE_BEGIN);DWORD got=0;if(!ReadFile(h,buf+carry,chunk,&got,NULL)||!got)break;DWORD total=carry+got;
+        for(DWORD i=0;i+0x28<=total;i++){if(!memcmp(buf+i,"UPGR_FMT",8)&&!memcmp(buf+i+0x10,"SONY",4)&&!memcmp(buf+i+0x20,"00100000",8)){off=base-(uint64_t)carry+i;found=TRUE;break;}}
+        if(found)break;carry=total<overlap?total:overlap;memmove(buf,buf+total-carry,carry);base+=got;}
+    VirtualFree(buf,0,MEM_RELEASE);CloseHandle(h);if(!found)return FALSE;*foundOffset=off;return ExtractContiguousUpgCandidate(imagePath,off,outPath,hashOut);
+}
+
+static BOOL ImageDerivedLayout(HANDLE dev, const FatLayout *f, WCHAR finalPath[MAX_PATH]) {
+    uint64_t totalSectors=(uint64_t)f->volumeStartLba+f->totalSectors;
+    uint64_t totalBytes=totalSectors*512ULL;
+    if(totalSectors==0 || totalSectors>0xFFFFFFFFULL || totalBytes>2ULL*1024*1024*1024){LogF(L"Derived image size rejected: %I64u bytes",totalBytes);return FALSE;}
+    WCHAR partial[MAX_PATH];_snwprintf(partial,MAX_PATH-1,L"%s\\NW-E405_rescue_%s.img.partial",g_exeDir,g_sessionStem);_snwprintf(finalPath,MAX_PATH-1,L"%s\\NW-E405_rescue_%s.img",g_exeDir,g_sessionStem);
+    HANDLE out=CreateFileW(partial,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);if(out==INVALID_HANDLE_VALUE)return FALSE;
+    BYTE *buf=(BYTE*)VirtualAlloc(NULL,64*1024,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);if(!buf){CloseHandle(out);return FALSE;}
+    uint64_t lba=0;BOOL ok=TRUE;int lastPct=-1;
+    while(lba<totalSectors){DWORD remain=(DWORD)(totalSectors-lba);WORD blocks=(WORD)(remain>128?128:remain);DWORD bytes=(DWORD)blocks*512;ScsiResult tr;
+        if(!Read10Chunk(dev,(DWORD)lba,blocks,buf,bytes,&tr)){TraceCdbJson(&tr);LogF(L"Rescue image READ(10) failed at LBA %lu blocks=%u status=%02X sense=%02X/%02X",(DWORD)lba,blocks,tr.scsiStatus,tr.sense[12],tr.sense[13]);ok=FALSE;break;}TraceCdbJson(&tr);
+        DWORD wr=0;if(!WriteFile(out,buf,bytes,&wr,NULL)||wr!=bytes){LogF(L"Host image write failed at LBA %lu",(DWORD)lba);ok=FALSE;break;}lba+=blocks;
+        int pct=(int)((lba*100ULL)/totalSectors);if(pct!=lastPct){lastPct=pct;if((pct%5)==0||pct==100){LogF(L"Rescue image progress: %d%%",pct);FlushFileBuffers(out);}SetStatus(L"No Media救出イメージを作成中...");}PumpMessages();}
+    FlushFileBuffers(out);CloseHandle(out);VirtualFree(buf,0,MEM_RELEASE);
+    if(ok&&lba==totalSectors){if(!MoveFileExW(partial,finalPath,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){LogF(L"Could not finalize rescue image: %lu",GetLastError());return FALSE;}LogF(L"Rescue image complete: %s",finalPath);return TRUE;}
+    LogF(L"Partial rescue image retained: %s",partial);return FALSE;
+}
+
+static void RescueNoMedia(void) {
+    if(!g_noMediaRescueAvailable || !g_exactDevicePath[0]){MessageBoxW(g_hwnd,L"先に診断を実行し、Issue #1のNo Media状態を確認してください。",L"Rescue locked",MB_OK|MB_ICONWARNING);return;}
+    int ans=MessageBoxW(g_hwnd,L"No Media状態でもLBA0をREAD(10)で512バイトだけ直接読みます。\n\n本体への書き込みコマンドは一切送信しません。\nLBA0が読めた場合だけFAT/MBRを解析し、続けてイメージ救出を提案します。\n\n開始しますか？",L"No Media read-only rescue",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);if(ans!=IDYES)return;
+    HANDLE dev=OpenDeviceRW(g_exactDevicePath,NULL);if(dev==INVALID_HANDLE_VALUE){LogF(L"No Media rescue: device open failed %lu",GetLastError());return;}
+    BYTE sec0[512];ZeroMemory(sec0,sizeof(sec0));ScsiResult tr;BOOL ok=Read10Chunk(dev,0,1,sec0,512,&tr);TraceCdbJson(&tr);
+    LogF(L"");LogF(L"=== NO MEDIA DIRECT READ(10) RESCUE ===");ShowScsiResult(L"READ(10) LBA=0 blocks=1",&tr);
+    if(!ok){LogF(L"LBA0 could not be read. The normal logical-NAND SCSI read path is unavailable in this state.");CloseHandle(dev);SetStatus(L"No Media救出: LBA0も読み出せませんでした");return;}
+    WCHAR sectorPath[MAX_PATH];_snwprintf(sectorPath,MAX_PATH-1,L"%s\\NW-E405_LBA0_%s.bin",g_exeDir,g_sessionStem);HANDLE sf=CreateFileW(sectorPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);if(sf!=INVALID_HANDLE_VALUE){DWORD wr=0;WriteFile(sf,sec0,512,&wr,NULL);FlushFileBuffers(sf);CloseHandle(sf);LogF(L"LBA0 saved: %s",sectorPath);}
+    FatLayout fat;BOOL parsed=ParseFatBootSector(sec0,0,&fat);
+    if(!parsed && sec0[510]==0x55 && sec0[511]==0xAA){
+        for(int i=0;i<4&&!parsed;i++){BYTE *pe=sec0+446+i*16;DWORD start=Le32(pe+8),count=Le32(pe+12);if(pe[4]&&start&&count&&((uint64_t)start+count)<0x400000ULL){BYTE boot[512];ScsiResult br;if(Read10Chunk(dev,start,1,boot,512,&br)){TraceCdbJson(&br);parsed=ParseFatBootSector(boot,start,&fat);if(parsed)LogF(L"MBR partition %d selected: type=%02X start=%lu sectors=%lu",i,pe[4],start,count);}else TraceCdbJson(&br);}}
+    }
+    if(!parsed){LogF(L"LBA0 is readable, but a supported FAT12/16/32 geometry could not be derived. No bulk read attempted.");CloseHandle(dev);SetStatus(L"LBA0読出し成功 — FAT/MBR解析はできませんでした");return;}
+    uint64_t bytes=(uint64_t)fat.totalSectors*512ULL;LogF(L"Derived FAT%d: volumeStart=%lu totalSectors=%lu (~%I64u bytes) SPC=%lu FATs=%lu SPF=%lu",fat.fatType,fat.volumeStartLba,fat.totalSectors,bytes,fat.sectorsPerCluster,fat.fatCount,fat.sectorsPerFat);
+    WCHAR msg[512];_snwprintf(msg,511,L"LBA0の直接読み出しに成功しました。FAT%dとして約%I64u MiBを推定しました。\n\nREAD(10)だけで論理ストレージの救出イメージを作成しますか？\n本体への書き込みは行いません。",fat.fatType,bytes/(1024*1024));msg[511]=0;
+    if(MessageBoxW(g_hwnd,msg,L"Create rescue image?",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES){CloseHandle(dev);return;}
+    WCHAR imagePath[MAX_PATH];BOOL imaged=ImageDerivedLayout(dev,&fat,imagePath);CloseHandle(dev);if(!imaged){SetStatus(L"救出イメージは途中で停止しました（partial保持）");return;}
+    WCHAR upgPath[MAX_PATH]={0},hash[65]={0};BOOL got=ExtractRootUpgFromImage(imagePath,&fat,upgPath,hash);
+    if(got){LogF(L"Recovered root MSFWUPGR.UPG: %s",upgPath);LogF(L"Recovered UPG SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691"))LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");else LogF(L"UPG COMPARISON: DOES NOT MATCH verified Japanese v2.0 UPG.");}
+    else {uint64_t off=0;if(ScanImageForUpg(imagePath,upgPath,hash,&off)){LogF(L"FAT root extraction failed, but raw UPGR_FMT candidate was found at image offset 0x%I64X",off);LogF(L"Raw candidate: %s",upgPath);LogF(L"Raw candidate SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691"))LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");else LogF(L"UPG COMPARISON: candidate header matches but SHA-256 differs from official v2.0.");}else LogF(L"No MSFWUPGR.UPG root entry or raw UPGR_FMT candidate was found in the rescued image.");}
+    SaveLog();SetStatus(L"No Media救出解析完了 — ログとIMG/UPG候補を確認してください");
+    MessageBoxW(g_hwnd,L"No Media救出解析が完了しました。\n\nログフォルダにIMGと、見つかった場合はMSFWUPGR.UPG候補を保存しました。\nTXT/JSONLと一緒にIssue #1へ添付してください。",L"Rescue analysis complete",MB_OK|MB_ICONINFORMATION);
 }
 
 static void BackupLogicalMedia(void) {
@@ -830,7 +1100,10 @@ static BOOL SaveLog(void) {
 }
 
 static void VerifyFirmwareGui(void) {
-    if (g_liveLog == INVALID_HANDLE_VALUE) StartSessionLogs();
+    if (g_liveLog == INVALID_HANDLE_VALUE && !StartSessionLogs()) {
+        MessageBoxW(g_hwnd,L"安全ログ（TXT/JSONL）を作成できないためファームウェア検証を開始しません。",L"Logging required",MB_OK|MB_ICONERROR);
+        return;
+    }
     OPENFILENAMEW ofn; ZeroMemory(&ofn,sizeof(ofn));
     WCHAR path[MAX_PATH]={0};
     ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
@@ -838,6 +1111,7 @@ static void VerifyFirmwareGui(void) {
     ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_HIDEREADONLY;
     if(!GetOpenFileNameW(&ofn))return;
     FirmwarePackageResult r; WCHAR err[512]={0};
+    g_officialFirmwareVerified = FALSE; g_verifiedUpgPath[0] = 0;
     LogF(L"");LogF(L"=== OFFICIAL FIRMWARE PACKAGE VERIFICATION ===");
     LogF(L"Selected: %s",path);
     if(VerifyAndExtractSonyFirmwarePackage(path,g_exeDir,&r,err,512)){
@@ -847,6 +1121,8 @@ static void VerifyFirmwareGui(void) {
         LogF(L"VERIFIED: exact Japanese NW-E405/E407 v2.0 package.");
         LogF(L"Verified UPG extracted to: %s",r.extractedPath);
         LogF(L"This operation writes only to the PC. Nothing was sent to the Walkman.");
+        g_officialFirmwareVerified = TRUE;
+        lstrcpynW(g_verifiedUpgPath, r.extractedPath, MAX_PATH);
         MessageBoxW(g_hwnd,L"Sony日本版NW-E405/E407 v2.0アップデータと完全一致しました。\n\nUPGをPC側の verified_firmware フォルダへ抽出しました。\n本体への書き込みは行っていません。",L"Firmware verified",MB_OK|MB_ICONINFORMATION);
     }else{
         LogF(L"REJECTED: %s",err);
@@ -860,7 +1136,10 @@ static void RunDiagnostics(void) {
     if(g_backup)EnableWindow(g_backup,FALSE);
     SetWindowTextW(g_output, L"");
     g_mediaBackupAvailable=FALSE; g_backupDevicePath[0]=0; g_backupCapacityBytes=0; g_backupBlockSize=0;
+    g_noMediaRescueAvailable=FALSE; g_exactDevicePath[0]=0;
     g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
+    g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
+    if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");
         MessageBoxW(g_hwnd, L"安全ログ（TXT/JSONL）を作成できないため診断を開始しません。\n\n書き込み可能なフォルダへEXEを移して再実行してください。", L"Logging required", MB_OK | MB_ICONERROR);
@@ -911,13 +1190,34 @@ static void RunDiagnostics(void) {
     }
 
     LogF(L"");
+    LogF(L"=== RECOVERY ASSESSMENT ===");
+    if (usb && sony > 0 && g_issue1TurNoMedia && g_issue1CapNoMedia && g_issue1FwInfoMatch) {
+        LogF(L"State signature: ISSUE #1 CURRENT-STATE MATCH");
+        LogF(L"- Exact NW-E405 identity: YES");
+        LogF(L"- User media: MEDIUM NOT PRESENT (3A00)");
+        LogF(L"- Sony FC/03: valid known 1.x firmware-info response");
+        LogF(L"Interpretation with the known 99%% history: POST-START UPDATE FAILURE CANDIDATE.");
+        LogF(L"Do NOT blindly resend FC/04: the original updater had already entered its post-start wait.");
+        LogF(L"A true force flash still needs a verified No-Media firmware transport or ROM/service protocol.");
+        g_noMediaRescueAvailable = (g_exactDevicePath[0] != 0);
+        if(g_noMediaRescueAvailable){
+            LogF(L"Read-only No-Media rescue is AVAILABLE: direct READ(10) LBA0 may now be tested.");
+            if(g_rescue)EnableWindow(g_rescue,TRUE);
+        }
+    } else {
+        LogF(L"State signature: not the exact Issue #1 No-Media/FW-info combination.");
+        LogF(L"Keep recovery actions locked; continue read-only analysis.");
+    }
+    LogF(L"Official Japanese v2.0 package verified this session: %s", g_officialFirmwareVerified ? L"YES" : L"NO");
+    LogF(L"");
     SaveMetadataBackup();
     LogF(L"TXT journal: %s",g_logPath);
     LogF(L"JSONL CDB trace: %s",g_jsonLogPath);
     LogF(L"診断完了。Issue #1へTXTとJSONLを添付してください。");
     SaveLog();
-    if(g_mediaBackupAvailable){SetStatus(L"診断完了 — 論理ストレージのREAD(10)バックアップが可能です");EnableWindow(g_backup,TRUE);}
-    else {SetStatus(L"診断完了 — No Mediaのため論理ストレージの丸ごとバックアップは不可");EnableWindow(g_backup,TRUE);}
+    if(g_mediaBackupAvailable){SetStatus(L"診断完了 — 通常ストレージ保存が可能です");EnableWindow(g_backup,TRUE);}
+    else if(g_noMediaRescueAvailable){SetStatus(L"診断完了 — 『No Media救出』を試せます");EnableWindow(g_backup,FALSE);}
+    else {SetStatus(L"診断完了 — 追加の読み取り経路はまだ利用できません");EnableWindow(g_backup,FALSE);}
     EnableWindow(g_scan, TRUE);
 }
 
@@ -968,45 +1268,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(title, WM_SETFONT, (WPARAM)fTitle, TRUE);
 
             HWND sub = CreateWindowW(L"STATIC",
-                L"Recovery Lab / 本体側は読み取り専用。診断・バックアップ・純正FW検証を行います。",
+                L"Windows 7向け Recovery Lab / 本体側は読み取り専用。No Media救出・FW比較を行います。",
                 WS_CHILD | WS_VISIBLE, 20, 48, 720, 24, hwnd, NULL, NULL, NULL);
             SendMessageW(sub, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             g_scan = CreateWindowW(L"BUTTON", L"診断する",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                20, 80, 105, 38, hwnd, (HMENU)ID_SCAN, NULL, NULL);
+                20, 80, 110, 36, hwnd, (HMENU)ID_SCAN, NULL, NULL);
             SendMessageW(g_scan, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
-            g_backup = CreateWindowW(L"BUTTON", L"ストレージ保存",
+            g_rescue = CreateWindowW(L"BUTTON", L"No Media救出",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                135, 80, 125, 38, hwnd, (HMENU)ID_BACKUP, NULL, NULL);
+                140, 80, 125, 36, hwnd, (HMENU)ID_RESCUE, NULL, NULL);
+            SendMessageW(g_rescue, WM_SETFONT, (WPARAM)fNormal, TRUE);
+            EnableWindow(g_rescue, FALSE);
+
+            g_backup = CreateWindowW(L"BUTTON", L"通常ストレージ保存",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                275, 80, 145, 36, hwnd, (HMENU)ID_BACKUP, NULL, NULL);
             SendMessageW(g_backup, WM_SETFONT, (WPARAM)fNormal, TRUE);
             EnableWindow(g_backup, FALSE);
 
             HWND verify = CreateWindowW(L"BUTTON", L"純正FWを検証",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                270, 80, 125, 38, hwnd, (HMENU)ID_VERIFY_FW, NULL, NULL);
+                430, 80, 130, 36, hwnd, (HMENU)ID_VERIFY_FW, NULL, NULL);
             SendMessageW(verify, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND copy = CreateWindowW(L"BUTTON", L"結果をコピー",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                405, 80, 105, 38, hwnd, (HMENU)ID_COPY, NULL, NULL);
+                20, 124, 110, 32, hwnd, (HMENU)ID_COPY, NULL, NULL);
             SendMessageW(copy, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND folder = CreateWindowW(L"BUTTON", L"ログフォルダ",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                520, 80, 105, 38, hwnd, (HMENU)ID_FOLDER, NULL, NULL);
+                140, 124, 115, 32, hwnd, (HMENU)ID_FOLDER, NULL, NULL);
             SendMessageW(folder, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             HWND github = CreateWindowW(L"BUTTON", L"GitHub",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                635, 80, 80, 38, hwnd, (HMENU)ID_GITHUB, NULL, NULL);
+                265, 124, 90, 32, hwnd, (HMENU)ID_GITHUB, NULL, NULL);
             SendMessageW(github, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             g_output = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
                 ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
-                20, 132, 744, 385, hwnd, (HMENU)ID_OUTPUT, NULL, NULL);
+                20, 168, 744, 350, hwnd, (HMENU)ID_OUTPUT, NULL, NULL);
             SendMessageW(g_output, WM_SETFONT, (WPARAM)fNormal, TRUE);
 
             g_status = CreateWindowW(L"STATIC",
@@ -1018,6 +1324,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND:
             switch (LOWORD(wp)) {
                 case ID_SCAN: RunDiagnostics(); return 0;
+                case ID_RESCUE: RescueNoMedia(); return 0;
                 case ID_BACKUP: BackupLogicalMedia(); return 0;
                 case ID_VERIFY_FW: VerifyFirmwareGui(); return 0;
                 case ID_COPY: CopyOutput(); return 0;
