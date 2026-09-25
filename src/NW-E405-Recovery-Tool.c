@@ -1,5 +1,3 @@
-#define UNICODE
-#define _UNICODE
 #include <windows.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
@@ -9,9 +7,10 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include <wchar.h>
+#include <string.h>
 #include <shellapi.h>
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.3-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.3.1-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -120,7 +119,7 @@ static HANDLE OpenDeviceRW(const WCHAR *path, DWORD *err) {
     return h;
 }
 
-static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen) {
+static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen, BYTE targetId) {
     ScsiResult r;
     ZeroMemory(&r, sizeof(r));
     if (h == INVALID_HANDLE_VALUE) return r;
@@ -139,11 +138,14 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
     SPTDWB pkt;
     ZeroMemory(&pkt, sizeof(pkt));
     pkt.sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    pkt.sptd.PathId = 0;
+    pkt.sptd.TargetId = targetId;
+    pkt.sptd.Lun = 0;
     pkt.sptd.CdbLength = cdbLen;
-    pkt.sptd.SenseInfoLength = sizeof(pkt.sense);
+    pkt.sptd.SenseInfoLength = 18;
     pkt.sptd.DataIn = dataLen ? SCSI_IOCTL_DATA_IN : SCSI_IOCTL_DATA_UNSPECIFIED;
     pkt.sptd.DataTransferLength = dataLen;
-    pkt.sptd.TimeOutValue = 8;
+    pkt.sptd.TimeOutValue = 5;
     pkt.sptd.DataBuffer = data;
     pkt.sptd.SenseInfoOffset = offsetof(SPTDWB, sense);
     CopyMemory(pkt.sptd.Cdb, cdb, cdbLen);
@@ -161,6 +163,10 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
     }
     if (data) HeapFree(GetProcessHeap(), 0, data);
     return r;
+}
+
+static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen) {
+    return SendCdbEx(h, cdb, cdbLen, dataLen, 0);
 }
 
 static void ShowScsiResult(const WCHAR *name, const ScsiResult *r) {
@@ -333,6 +339,13 @@ static int ProbeRemovableDriveLetters(void) {
 
 static int ProbeSonyScsiPaths(void) {
     int matches = 0;
+    int openCount = 0;
+    int inquiryOkCount = 0;
+    int fileNotFoundCount = 0;
+    int accessDeniedCount = 0;
+    int otherOpenErrors = 0;
+    int mapperSupportedCount = 0;
+    int mapperMatchCount = 0;
     LogF(L"");
     LogF(L"=== Sony/NT scsipath probe ===");
     LogF(L"Checking \\\\.\\scsipath0 ... \\\\.\\scsipath25 (read-only commands only)");
@@ -343,18 +356,53 @@ static int ProbeSonyScsiPaths(void) {
 
         DWORD err = 0;
         HANDLE h = OpenDeviceRW(path, &err);
-        if (h == INVALID_HANDLE_VALUE)
+        if (h == INVALID_HANDLE_VALUE) {
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                fileNotFoundCount++;
+            else if (err == ERROR_ACCESS_DENIED)
+                accessDeniedCount++;
+            else
+                otherOpenErrors++;
             continue;
+        }
 
+        openCount++;
         LogF(L"scsipath%d: OPEN", i);
+
+        // Mirror the original updater's NT path mapping:
+        // QueryDosDeviceA("X:") -> DeviceIoControl(0x7048C) on scsipathN.
+        for (char drive = 'A'; drive <= 'Z'; ++drive) {
+            char dosName[3] = { drive, ':', 0 };
+            char ntTarget[512] = {0};
+            DWORD q = QueryDosDeviceA(dosName, ntTarget, sizeof(ntTarget));
+            if (!q)
+                continue;
+
+            DWORD mapped = 0, bytesReturned = 0;
+            BOOL mapOk = DeviceIoControl(
+                h, 0x0007048C,
+                ntTarget, (DWORD)strlen(ntTarget),
+                &mapped, sizeof(mapped),
+                &bytesReturned, NULL);
+
+            if (mapOk) {
+                mapperSupportedCount++;
+                if (mapped != 0) {
+                    mapperMatchCount++;
+                    LogF(L"  Original-updater mapping: %c: -> scsipath%d (NT target=%S)",
+                        (WCHAR)drive, i, ntTarget);
+                }
+            }
+        }
 
         BYTE cdb[16] = {0};
         cdb[0] = 0x12;
         cdb[4] = 96;
-        ScsiResult inq = SendCdb(h, cdb, 6, 96);
+        ScsiResult inq = SendCdbEx(h, cdb, 6, 96, 1);
 
         WCHAR vendor[32] = {0}, product[64] = {0}, rev[16] = {0};
         if (inq.ioctlOk && inq.scsiStatus == 0 && inq.dataLen >= 36) {
+            inquiryOkCount++;
             BytesToAscii(inq.data, 8, 8, vendor, 32);
             BytesToAscii(inq.data, 16, 16, product, 64);
             BytesToAscii(inq.data, 32, 4, rev, 16);
@@ -391,9 +439,9 @@ static int ProbeSonyScsiPaths(void) {
         cdb[0] = 0xFC;
         cdb[2] = 0x03;
         cdb[7] = 0x00;
-        cdb[8] = 0x40;
+        cdb[8] = 0x08;
 
-        ScsiResult sonyInfo = SendCdb(h, cdb, 12, 64);
+        ScsiResult sonyInfo = SendCdbEx(h, cdb, 12, 8, 1);
         ShowScsiResult(L"SONY 0xFC/0x03 via scsipath (read-only)", &sonyInfo);
 
         if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0) {
@@ -409,10 +457,19 @@ static int ProbeSonyScsiPaths(void) {
         CloseHandle(h);
     }
 
-    if (matches == 0)
-        LogF(L"No SONY / NWWM MEM AAD2 device was found through scsipath0..25.");
+    if (openCount == 0) {
+        LogF(L"No scsipath device could be opened.");
+        LogF(L"Open errors: not-found=%d access-denied=%d other=%d",
+            fileNotFoundCount, accessDeniedCount, otherOpenErrors);
+        LogF(L"This usually means the legacy Sony/PCD scsipath layer is not present.");
+    } else if (matches == 0) {
+        LogF(L"scsipath handles exist, but no SONY / NWWM MEM AAD2 device was found.");
+    }
 
-    LogF(L"scsipath matches: %d", matches);
+    LogF(L"scsipath summary: opened=%d inquiry-ok=%d identity-match=%d",
+        openCount, inquiryOkCount, matches);
+    LogF(L"original-updater mapper: supported-calls=%d drive-matches=%d",
+        mapperSupportedCount, mapperMatchCount);
     LogF(L"");
     return matches;
 }
@@ -490,8 +547,8 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
         cdb[0] = 0xFC;
         cdb[2] = 0x03;
         cdb[7] = 0x00;
-        cdb[8] = 0x40;
-        ScsiResult sonyInfo = SendCdb(h, cdb, 12, 64);
+        cdb[8] = 0x08;
+        ScsiResult sonyInfo = SendCdb(h, cdb, 12, 8);
         ShowScsiResult(L"SONY 0xFC/0x03 (read-only vendor query)", &sonyInfo);
 
         if (sonyInfo.ioctlOk && sonyInfo.scsiStatus == 0)

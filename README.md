@@ -7,7 +7,7 @@
 >
 > Sony Network Walkman **NW-E405** がファームウェア更新失敗後に `MEMORY ERROR` となり、Windowsではリムーバブルディスクが見えるものの「ディスクを挿入してください / No Media」となる症状を調査・復旧するための実験的ツールです。
 
-## GUI版 v0.3-dev
+## GUI版 v0.3.1-dev
 
 現在の推奨版は **`NW-E405-Recovery-Tool.exe`** です。
 
@@ -27,7 +27,7 @@ NW-E405_diag_YYYYMMDD_HHMMSS.txt
 
 6. **「結果をコピー」** またはログファイルを使って結果を共有してください。
 
-## v0.3-devで実行する処理
+## v0.3.1-devで実行する処理
 
 Stage 1は意図的に **READ-ONLY** です。
 
@@ -50,9 +50,26 @@ Stage 1は意図的に **READ-ONLY** です。
 - ファームウェア書き込み
 - Sony更新開始コマンド `0xFC / 0x04`
 
-そのため、v0.3-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
+そのため、v0.3.1-devは **復旧そのものではなく、復旧可能性を判断する診断版** です。
 
 
+
+
+## v0.3.1-devで修正した点
+
+純正 `FWUpdaterCom.dll` を再度逆アセンブルし、v0.3-devとの差分を修正しました。
+
+- `FC/03` の受信サイズを純正 `FWInfoSize=8` に合わせて **8 bytes** に変更
+- `scsipath` 経路のSCSI Pass Throughを純正と同じ **PathId=0 / TargetId=1 / Lun=0** に変更
+- Sense buffer lengthを純正と同じ **18 bytes** に変更
+- SCSI timeoutを純正と同じ **5 seconds** に変更
+- 純正UpdaterがWindows NT系で行う `QueryDosDeviceA("X:")` → `DeviceIoControl(0x7048C)` のドライブ文字→`scsipathN`対応確認を追加
+- `scsipath` のopen数、INQUIRY成功数、機種一致数、マッピング成功数をログへ追加
+- `scsipath` が一つも存在しない場合、not-found / access-denied / other の内訳を表示
+
+この変更により、次回ログでは「旧Sony/PCD scsipath層が存在しない」「存在するがNW-E405へ到達しない」「到達するがFC/03のみ拒否される」を切り分けやすくなりました。
+
+**引き続きSCSI DATA OUT経路と `0xFC/0x04` 更新開始コマンドは含まれていません。**
 
 ## v0.3-dev: scsipath診断
 
@@ -145,6 +162,7 @@ chkdsk /f
 - [x] PowerShell READ-ONLY prototype v0.1
 - [x] Windows 7対応ネイティブGUI v0.2.1-dev
 - [x] Windows NT系 scsipath0..25 読み取り診断 v0.3-dev
+- [x] 純正Updater互換パラメータ・scsipathマッピング診断 v0.3.1-dev
 - [ ] 故障実機からGUI版ログ収集
 - [ ] SONYSPTI / scsipath経路への対応
 - [ ] Sony vendor command応答の詳細解析
@@ -174,4 +192,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.3-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
+**v0.3.1-dev is a native Windows 7 GUI diagnostic executable. Stage 1 is read-only: no formatting, sector writes, firmware writes, UPG copying, or Sony update-start command are performed.**
