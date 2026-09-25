@@ -13,6 +13,7 @@ def synthetic(model=E40X_MODEL_ID, total=True):
 
 def test_structure_e40():
     i=parse_bytes(synthetic()); assert i.structure_ok and not i.exact_japanese_e40x
+    assert i.section_types == EXPECTED_SECTION_TYPES
 
 def test_wrong_family():
     i=parse_bytes(synthetic(E50X_MODEL_ID)); assert not i.exact_japanese_e40x and 'E50X' in i.reason
@@ -38,3 +39,7 @@ def test_mutation_rejected_as_exact():
     for _ in range(5000):
         c=bytearray(b); j=rnd.randrange(len(c)); c[j]^=1+rnd.randrange(255)
         assert not parse_bytes(bytes(c)).exact_japanese_e40x
+
+def test_wrong_descriptor_type_rejected():
+    b=bytearray(synthetic()); b[0x68]=6
+    i=parse_bytes(bytes(b)); assert not i.structure_ok and 'types' in i.reason

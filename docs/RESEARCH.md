@@ -144,3 +144,34 @@ FC/04 is no longer treated as a generic recovery command. v0.7 makes it reachabl
 ### Privacy
 
 Full CDB JSONL, metadata, DvID, sectors, images and recovered UPG files are private evidence. v0.7 generates a separate public report containing only status flags and hashes.
+
+
+## Related-model reference: NW-A600 v2.0 updater
+
+Sony's official NW-A605/A607/A608 v2.0 updater is used strictly as related-model protocol evidence. It must **never** be used as firmware/PBR data for an NW-E405.
+
+Pinned local reference hashes:
+
+- `NW-A600_V2_0.exe`: `3ea05d6601e0e1c7a039f1c88fcc9cca9a49682cd87ef5e604bbc570ec89d552`
+- `FWUpdaterCom.dll`: `56aa815bbe6e3441bd3e3168e9511dce94f2e0927167f1671f1a9a8c40ca58bf`
+- Japanese normal UPG: `0ad8f764a4b3e0aad3ae1a6a70be7e68fa0686a5a3395ba061bbe071e566a963`
+- Japanese BOOT21 UPG: `72a7e13686b7cf10ed0e43772f17e069bb30b20c43a90ef693441d6a76cfdbf5`
+
+The type library exposes `IFWUpdaterComExt` with `GetPowerStatus`, `GetDeviceInfo`, `CheckStorageFormatType`, `SendFWUpdateCommandExt`, `DeleteUpdateFileExt`, and `GetDeviceIdExt`.
+
+Two fixed DATA-IN vendor queries were reconstructed from the exact DLL:
+
+- `FB 00 00 50 57 5F 53 54 41 54 20 00` (`PW_STAT`) -> 32-byte DATA IN (`GetPowerStatus`).
+- `FB 00 00 44 45 56 49 4E 46 4F 80 00` (`DEVINFO`) -> 128-byte DATA IN (`GetDeviceInfo`).
+
+The E40X updater DLL contains neither `IFWUpdaterComExt` nor these strings, so E405 support is unproven. A research branch therefore treats them as explicitly-confirmed, related-model, read-only probes only after the exact Issue #1 state and failed LBA0 READ(10) are established.
+
+`CheckStorageFormatType` performs two SCSI `READ(10)` operations: it reads LBA0 (MBR), obtains partition #0 start-LBA from offset `0x1C6`, reads that PBR, and compares BPB ranges against Sony's supplied PBR template. It does not write a PBR. This independently supports the Recovery Tool's raw-sector-first approach.
+
+The 512 MiB A600 reference PBR is FAT16, 512 bytes/sector, 32 sectors/cluster, two FATs, 512 root entries, and 43 hidden sectors. This is a related-model reference only, not an E405 repair image.
+
+The UPG descriptor table contains semantic record types as well as big-endian lengths. Normal A600 uses `(type 4, 0x1F8018)` for the large record, while the `BootstrapVersion=2.0` BOOT21 package uses `(type 6, 0x200018)`. Their payload-size delta is exactly `0x8000` (32 KiB). The normal and BOOT21 large payloads are not simple prefix/suffix copies, so the exact omitted/included address range cannot be inferred from size alone.
+
+The A600 service documentation also exposes `XBOOT`, `TXD1`, `RXD1`, and `DEBUG` test points and identifies the SoC boot-selection pins. Electrical levels, boot timing and protocol are still unresolved; no physical XBOOT procedure should be attempted from these findings alone.
+
+Re-run the local evidence audit with `tools/a600_related_updater_audit.py`.

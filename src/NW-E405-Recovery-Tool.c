@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.7-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.8-research"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -60,6 +60,10 @@ static BOOL g_resumeEligible = FALSE;
 static BOOL g_vendorDvIdRead = FALSE;
 static BYTE g_vendorDvId[16] = {0};
 static WCHAR g_vendorDvIdSha256[65] = {0};
+static BOOL g_fbPowerStatusRead = FALSE;
+static BOOL g_fbDeviceInfoRead = FALSE;
+static WCHAR g_fbPowerStatusSha256[65] = {0};
+static WCHAR g_fbDeviceInfoSha256[65] = {0};
 static uint64_t g_rescueFreeBytes = 0;
 static BOOL g_rescueFreeKnown = FALSE;
 static WCHAR g_publicReportPath[MAX_PATH] = {0};
@@ -313,6 +317,34 @@ static BOOL Sha256BytesHex(const BYTE *data, DWORD len, WCHAR out[65]) {
         }
     }
     if(hash)CryptDestroyHash(hash);CryptReleaseContext(prov,0);return ok;
+}
+
+static void QueryRelatedModelFbReadOnly(void) {
+    if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
+        LogF(L"A600-reference FB probes locked: Issue #1 state is not currently established."); return;
+    }
+    if(MessageBoxW(g_hwnd,
+        L"通常のREAD(10)経路ではLBA0を読めませんでした。\n\n"
+        L"次に、同世代のSony NW-A600公式Updaterで使われる読み取り専用vendor queryを2本だけ試します。\n"
+        L"・FB / PW_STAT : DATA IN 32 bytes\n"
+        L"・FB / DEVINFO : DATA IN 128 bytes\n\n"
+        L"NW-E405純正Updaterにはこの拡張機能は無いため、E405が対応するかは未確認です。"
+        L"PC→本体のデータpayloadは送信しません。\n\n試しますか？",
+        L"Recovery Stage 2A - Sony FB read probes",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES)return;
+    HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL);if(h==INVALID_HANDLE_VALUE){LogF(L"FB probes: device open failed %lu",GetLastError());return;}
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2A: RELATED-MODEL SONY FB READ PROBES ===");
+    LogF(L"Reference: Sony NW-A600 official updater IFWUpdaterComExt. E405 command compatibility is NOT assumed.");
+    BYTE pwrCdb[12]={0xFB,0,0,'P','W','_','S','T','A','T',0x20,0};
+    ScsiResult pwr=SendCdb(h,pwrCdb,12,32);
+    LogF(L"FB/PW_STAT: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X DataLen=%lu",
+        pwr.ioctlOk?L"OK":L"FAIL",pwr.scsiStatus,pwr.sense[12],pwr.sense[13],pwr.dataLen);
+    if(pwr.ioctlOk&&pwr.scsiStatus==0&&pwr.dataLen>=32){g_fbPowerStatusRead=TRUE;Sha256BytesHex(pwr.data,32,g_fbPowerStatusSha256);LogF(L"FB/PW_STAT SUCCESS; response SHA-256: %s",g_fbPowerStatusSha256);}
+    BYTE devCdb[12]={0xFB,0,0,'D','E','V','I','N','F','O',0x80,0};
+    ScsiResult dev=SendCdb(h,devCdb,12,128);CloseHandle(h);
+    LogF(L"FB/DEVINFO: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X DataLen=%lu",
+        dev.ioctlOk?L"OK":L"FAIL",dev.scsiStatus,dev.sense[12],dev.sense[13],dev.dataLen);
+    if(dev.ioctlOk&&dev.scsiStatus==0&&dev.dataLen>=128){g_fbDeviceInfoRead=TRUE;Sha256BytesHex(dev.data,128,g_fbDeviceInfoSha256);LogF(L"FB/DEVINFO SUCCESS; response SHA-256: %s",g_fbDeviceInfoSha256);}
+    LogF(L"Raw FB responses are retained only in the PRIVATE JSONL trace. PUBLIC_REPORT contains status/hashes only.");
 }
 
 static BOOL QueryVendorDvId(void) {
@@ -1193,7 +1225,7 @@ static void SavePublicReport(void) {
     HANDLE h=CreateFileW(g_publicReportPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
     if(h==INVALID_HANDLE_VALUE)return;
     DWORD wr=0;BYTE bom[3]={0xEF,0xBB,0xBF};WriteFile(h,bom,3,&wr,NULL);
-    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.7-dev - PUBLIC REPORT");
+    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8-research - PUBLIC REPORT");
     WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID, image sectors, music data, or full vendor responses.");
     WCHAR b[512];
     _snwprintf(b,511,L"Exact USB/SCSI identity: %s",g_exactDevicePath[0]?L"YES":L"NO");WriteUtf8Line(h,b);
@@ -1204,6 +1236,10 @@ static void SavePublicReport(void) {
     _snwprintf(b,511,L"Root MSFWUPGR.UPG exact official match: %s",g_rootPackageIntact?L"YES":L"NO");WriteUtf8Line(h,b);
     if(g_rescueFreeKnown){_snwprintf(b,511,L"Rescued FAT current free bytes: %I64u",g_rescueFreeBytes);WriteUtf8Line(h,b);}
     _snwprintf(b,511,L"Recovery resume eligibility: %s",g_resumeEligible?L"YES":L"NO");WriteUtf8Line(h,b);
+    _snwprintf(b,511,L"Related-model FB/PW_STAT read: %s",g_fbPowerStatusRead?L"SUCCESS":L"NO DATA");WriteUtf8Line(h,b);
+    if(g_fbPowerStatusRead){_snwprintf(b,511,L"FB/PW_STAT response SHA-256 only: %s",g_fbPowerStatusSha256);WriteUtf8Line(h,b);}
+    _snwprintf(b,511,L"Related-model FB/DEVINFO read: %s",g_fbDeviceInfoRead?L"SUCCESS":L"NO DATA");WriteUtf8Line(h,b);
+    if(g_fbDeviceInfoRead){_snwprintf(b,511,L"FB/DEVINFO response SHA-256 only: %s",g_fbDeviceInfoSha256);WriteUtf8Line(h,b);}
     _snwprintf(b,511,L"A3/A4 Device-ID query: %s",g_vendorDvIdRead?L"SUCCESS":L"NOT ACQUIRED");WriteUtf8Line(h,b);
     if(g_vendorDvIdRead){_snwprintf(b,511,L"Device-ID SHA-256 only: %s",g_vendorDvIdSha256);WriteUtf8Line(h,b);}
     WriteUtf8Line(h,L"PRIVATE: JSONL trace, metadata.bin, DvID bin, LBA/IMG, recovered UPG. Do NOT attach those to a public issue unless intentionally sharing their contents.");
@@ -1272,7 +1308,8 @@ static void RunRecoveryLadder(void) {
         if(g_rootPackageIntact&&g_resumeEligible&&g_officialFirmwareVerified){if(MessageBoxW(g_hwnd,L"救出したMSFWUPGR.UPGが公式v2.0と完全一致し、更新再開条件も通りました。\n続けてFC/04更新再開を試しますか？",L"Recovery Stage 3 available",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)ResumeVerifiedUpdate();return;}
     }
     if(g_lba0Unreadable){
-        if(MessageBoxW(g_hwnd,L"通常のREAD(10)経路ではLBA0も読めませんでした。\n\n次にSony MP3 File ManagerのNW-E405実機キャプチャ由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2 - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)QueryVendorDvId();
+        QueryRelatedModelFbReadOnly();
+        if(MessageBoxW(g_hwnd,L"次にSony MP3 File ManagerのNW-E405実機キャプチャ由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2B - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)QueryVendorDvId();
         SavePublicReport();return;
     }
     LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();
@@ -1318,7 +1355,7 @@ static void RunDiagnostics(void) {
     g_noMediaRescueAvailable=FALSE; g_exactDevicePath[0]=0;
     g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
     g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
-    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
+    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0; g_fbPowerStatusRead=FALSE; g_fbDeviceInfoRead=FALSE; g_fbPowerStatusSha256[0]=0; g_fbDeviceInfoSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");

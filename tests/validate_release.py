@@ -5,13 +5,17 @@ s=(root/'src/NW-E405-Recovery-Tool.c').read_text(encoding='utf-8')
 fwp=(root/'src/fw_package.c').read_text(encoding='utf-8')
 allc=s+'\n'+fwp
 checks={
- 'v0.7 recovery build':'NW-E405 Recovery Tool v0.7-dev' in s,
+ 'v0.8 research build':'NW-E405 Recovery Tool v0.8-research' in s,
  'exact VID/PID':'VID_054C&PID_01FB' in s,
  'exact SCSI identity':'NWWM MEM AAD2' in s,
  'exactly one DATA OUT implementation':allc.count('SCSI_IOCTL_DATA_OUT')==1 and 'SendFixedA3SelectDeviceId' in s,
  'fixed A3 CDB':'0xA3,0,0,0,0,0,0,0xBC,0,0x14,0x30,0' in s,
  'fixed A3 payload':'BYTE payload[20]={0}; payload[1]=0x12;' in s,
  'fixed A4 CDB':'0xA4,0,0,0,0,0,0,0xBC,0,0x12,0x3F,0' in s,
+ 'fixed FB PW_STAT CDB':"BYTE pwrCdb[12]={0xFB,0,0,'P','W','_','S','T','A','T',0x20,0};" in s and 'SendCdb(h,pwrCdb,12,32)' in s,
+ 'fixed FB DEVINFO CDB':"BYTE devCdb[12]={0xFB,0,0,'D','E','V','I','N','F','O',0x80,0};" in s and 'SendCdb(h,devCdb,12,128)' in s,
+ 'FB probes remain DATA IN only':allc.count('SCSI_IOCTL_DATA_OUT')==1,
+ 'FB related-model warning':'NW-A600' in s and '未確認' in s,
  'A4 record validation':'rd.data[0]!=0x00 || rd.data[1]!=0x10' in s,
  'exactly one FC04 builder':len(re.findall(r'cdb\s*\[\s*2\s*\]\s*=\s*0x04\b',s,re.I))==1,
  'FC04 no-data send':'SendCdb(h,cdb,12,0)' in s,

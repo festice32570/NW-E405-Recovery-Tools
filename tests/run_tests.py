@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util, inspect, pathlib, sys, traceback
 root=pathlib.Path(__file__).resolve().parent
-files=['test_upg_analyzer.py','test_recovery_state.py','test_official_package_local.py','test_original_updater_controlflow.py','test_win7_compat.py','test_rescue_fat.py','test_v07_recovery_ladder.py']
+files=['test_upg_analyzer.py','test_recovery_state.py','test_official_package_local.py','test_original_updater_controlflow.py','test_win7_compat.py','test_rescue_fat.py','test_v07_recovery_ladder.py','test_v08_fb_reference.py']
 failed=0; total=0
 for fn in files:
  p=root/fn
