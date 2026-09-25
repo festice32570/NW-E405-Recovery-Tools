@@ -97,3 +97,49 @@ def test_fragmented_real_official_upg_roundtrip():
     recovered=_extract_root_upg_fat16(img)
     assert recovered==payload
     assert hashlib.sha256(recovered).hexdigest()=='82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691'
+
+def make_fat16_image_with_root_upg(payload=b'UPGR_FMT'+b'X'*1024):
+    total=8192; img=bytearray(total*512)
+    bs=fat16_boot(total); img[:512]=bs
+    # FAT16: cluster 2 EOC. FAT starts at sector 1, root at sector 33, data at 65.
+    fat=512
+    img[fat:fat+2]=b'\xf8\xff'
+    img[fat+2:fat+4]=b'\xff\xff'
+    img[fat+4:fat+6]=b'\xff\xff'
+    root=33*512
+    img[root:root+11]=b'MSFWUPGRUPG'
+    img[root+11]=0x20
+    img[root+26:root+28]=(2).to_bytes(2,'little')
+    img[root+28:root+32]=len(payload).to_bytes(4,'little')
+    data=65*512
+    img[data:data+len(payload)]=payload
+    return img
+
+def find_root_83(img, layout):
+    root=(layout['start']+1+layout['spf'])*512
+    root_bytes=layout['rootsecs']*512
+    for off in range(root,root+root_bytes,32):
+        e=img[off:off+32]
+        if e[0]==0: return None
+        if e[0] in (0xE5,) or e[11]==0x0F: continue
+        if e[:11]==b'MSFWUPGRUPG': return (le16(e,26),le32(e,28))
+    return None
+
+def test_synthetic_fat16_root_upg_discovery():
+    payload=b'UPGR_FMT'+b'\x00'*2040
+    img=make_fat16_image_with_root_upg(payload)
+    layout=parse_fat(img[:512]); assert layout
+    found=find_root_83(img,layout)
+    assert found==(2,len(payload))
+    data_off=layout['first']*512
+    assert img[data_off:data_off+8]==b'UPGR_FMT'
+
+def test_raw_signature_scan_model_across_chunk_boundary():
+    sig=b'UPGR_FMT'+b'\x00'*8+b'SONY'+b'\x00'*12+b'00100000'
+    boundary=1024*1024-3
+    img=bytearray(boundary+len(sig)+64)
+    img[boundary:boundary+len(sig)]=sig
+    assert img.find(b'UPGR_FMT')==boundary
+    off=img.find(b'UPGR_FMT')
+    assert img[off+0x10:off+0x14]==b'SONY'
+    assert img[off+0x20:off+0x28]==b'00100000'
