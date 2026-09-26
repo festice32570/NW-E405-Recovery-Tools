@@ -206,3 +206,126 @@ This proves that the E405-era Sony software contains a richer vendor-command fam
 The MP3 File Manager `FrankPACAPI.dll` also contains `_CFrankFileSystem_StartQuickFmt`, FAT/no-filesystem medium enums, and Quick/Full erase frameworks. Current static analysis shows the QuickFormat worker is layered through filesystem/format helper structures and does not yet prove a No-Media-bypassing raw flash command. Therefore QuickFormat must not be invoked on the failed unit until its lower transport is mapped and its destructive operations are separated from read-only/status operations.
 
 Updated software-recovery research order after this cross-check: (1) current v0.8.1 read-only FB + A3/A4 evidence, (2) map and cautiously add proven read-only `SONYICD` Get commands, (3) finish FrankPACAPI QuickFormat/device-control transport analysis, then (4) XBOOT/boot-ROM only if the software service paths are exhausted. The earlier shortcut "FB+A3/A4 fail -> XBOOT" was premature.
+
+## Deep transport/package audit (2026-09-26)
+
+### `SONYICD` is transportable over standard Windows SPTI
+
+The `SONYICD` discovery was followed through `IcdMSCom.dll` all the way to a standard Windows SCSI pass-through backend, rather than stopping at the generic vendor-CDB builder.  The DLL contains multiple historical backends/paths (`\\.\scsipath%d`, `\\.\SONYSPTI`, a drive-letter path, and legacy Windows code), but the command semantics sit above them.
+
+One backend uses a common routine at the exact analyzed image address `0x10001080` that builds a `SCSI_PASS_THROUGH`-style request (`Length=0x2c`, `SenseInfoLength=0x12`, `SenseInfoOffset=0x30`) and invokes `DeviceIoControl` with `0x4D014`.  Three thin wrappers feed the same routine with mode values 2/1/0:
+
+- wrapper `0x10002540`: mode 2, no data;
+- wrapper `0x10002560`: mode 1, DATA IN;
+- wrapper `0x10002580`: mode 0, DATA OUT.
+
+The generic `FC 00 <command> "SONYICD" <length>` builder dispatches command families to those no-data / data-in / data-out virtual methods.  This materially strengthens the case that the exact `SONYICD` Get CDBs can be issued by the recovery tool's existing Windows SPTI transport even when the normal logical media is `3A00`, because they are ordinary SCSI CDBs at this layer rather than opaque calls that require Sony's proprietary application stack.
+
+The best first E405-native candidate is therefore:
+
+`FC 00 01 53 4F 4E 59 49 43 44 00 74` — `GetTargetIdentifier`, DATA IN `0x74`.
+
+A secondary candidate is:
+
+`FC 00 02 53 4F 4E 59 49 43 44 00 48` — `GetPreferenceInfo`, DATA IN `0x48`.
+
+The current release does **not** send either command yet.  A pure static builder/specification is in `tools/sonyicd_spec.py`; it performs no device I/O.  `tools/icdmscom_protocol_audit.py` now pins the command builder, SPTI structure, direction wrappers, family dispatch and response-parsing evidence against the exact Sony DLL.
+
+`GetTargetIdentifier` checks byte `response[0x0F]` as a device-side status result.  The successful-response parser copies two strings and converts a mixture of 16-bit and 32-bit fields using `ntohs`/`ntohl`.  Until every field is identified, the raw 0x74-byte response must be treated as PRIVATE/device-specific evidence.  A public report may safely expose command outcome, SCSI/Sense result, response length and a SHA-256 of the raw response, but not the raw strings/identifiers.
+
+The `0x04/0x05` GetRevokeList commands are read-only but are low-value recovery probes and appear DRM/revocation-related; they should not be sent merely because they exist.  The `0x41..0x45` Set family is DATA OUT and must remain disabled on the failed unit.  `0x80 Reset` is no-data but state-changing and likewise is not a diagnostic probe.
+
+### FrankPACAPI: QuickFormat is not the missing No-Media recovery transport
+
+Deeper tracing of `_CFrankFileSystem_StartQuickFmt` and its worker changed the interpretation of the MP3 File Manager's format support.  The worker calls ordinary filesystem functions including `GetDiskFreeSpaceExA`, `DeleteFileA`, `RemoveDirectoryA`, `CreateDirectoryA`, and path/directory helpers.  It builds and manipulates filesystem-format operation structures and waits on worker events.  Current evidence therefore points to a mounted/logical-filesystem formatting workflow, not a hidden raw-NAND erase/program path that bypasses `3A00 MEDIUM NOT PRESENT`.
+
+Quick/Full erase strings remain useful historical evidence about application features, but invoking QuickFormat on the failed unit is neither justified nor safe.  This branch is now lower priority than the E405-native read-only vendor protocol.
+
+FrankPACAPI does contain another bounded read-only SCSI operation: a `MODE SENSE(10)` CDB beginning `5A 00 3F` with an eight-byte allocation.  It passes through the shared SCSI transport and is used as a capability/status check before additional logic.  It may be useful later for state classification, but it has less direct recovery value than `SONYICD GetTargetIdentifier` and should not be added simply to increase probe count.
+
+### UPG payload block-boundary observations
+
+Aligned comparisons were extended beyond whole-record hashes.  Important observations from the available official packages are:
+
+- E40X-J and E50X-J record 3 are byte-for-byte identical for all `0x10518` bytes.
+- A600-J and A600-C record 3 are byte-for-byte identical for all `0x10510` bytes.
+- E40X and normal A600 record 3 remain identical through exactly `0x750` bytes and then diverge; no later same-position 8-byte block re-synchronizes.
+- Normal type-4 records from E40X, E50X, A600-J and A600-C all begin with the same eight bytes `A3 50 92 8E 14 8B 49 E1`; the next aligned eight-byte block differs, and no later same-position eight-byte block matches in the tested pairs.
+- Record-3 payloads begin with `31 43 DF A9 85 B9 B6 13` across the compared packages.
+- The A600 BOOT21 type-6 large record begins with a different fixed-looking eight-byte value (`FD 79 EA 57 50 FE F7 2C`) and differs from the normal type-4 record from byte zero.
+
+Divergence starting exactly at eight-byte boundaries, followed by no same-position block re-synchronization, is **consistent with** a deterministic chained transform with a 64-bit granularity (a CBC-like property is one plausible example).  It does not prove that the data is encrypted, does not identify DES/3DES or any other cipher, and does not establish a key/IV layout.  Compression plus encryption/obfuscation could produce similar observations.
+
+The repeated eight-byte prefix on all normal type-4 records is particularly interesting: it behaves more like a per-record-type preamble/IV-like value than ordinary model-specific firmware bytes.  Again this is a structural hypothesis only.
+
+The recurring `+0x18` size is also notable.  Removing 24 bytes from the A600 BOOT21 type-6 record leaves exactly `0x200000` bytes (2 MiB); removing 24 bytes from a normal type-4 record leaves `0x1F8000`.  Record-3 sizes similarly become clean eight-byte-aligned core sizes.  Simple MD5-of-record and CRC32 checks do not explain a 16-byte trailer, so the 24 bytes must not yet be labelled as a specific IV/hash/signature structure.  `tools/upg_block_compare.py` records the reproducible aligned-block observations without claiming a cipher.
+
+The official PC updater binaries do not contain the `UPGR_FMT` magic or E40X model identifier and do not expose an obvious package decrypt/decompress path; they copy the UPG as a file before `FC/04`.  The strongest current interpretation is therefore that UPG parsing/verification/transformation occurs on the player side.  That is another reason a modified PC updater is not, by itself, a No-Media force-flash transport.
+
+### Missing high-value comparison artifact: official E40X overseas package
+
+Sony's still-indexed support pages identify the overseas package as `NW-E40X_V2_0C.exe`, approximately 2239 KB / 2.19 MB.  The historical direct URL was `https://www.aii.co.jp/contents/smojsdmk/overseas/support/NW-E40X_V2_0C.exe`, but that endpoint is no longer serving the binary and current Sony regional pages expose an unusable/dead download flow in this environment.
+
+A trusted copy of this exact official package remains a high-value research artifact: E40X-J versus E40X-C would separate region-dependent payload behavior without also changing the hardware family.  Do not substitute an unverified mirror merely to obtain a comparison sample.
+
+### Hardware boundary after software-path review
+
+The NW-E403/E405/E407 service manual itself identifies `TP404 TXD1`, `TP405 RXD1`, `TP412 DEBUG`, `TP409 XBOOT`, and `IC400 CXR704060-202GA`.  Its block diagram also separates `Q501/Q502 NAND FLASH RAM` from `IC450 NOR FLASH / SRAM`.  CXR704060 documentation independently confirms a dedicated flash-memory interface, a separate 16-bit external bus, and UART channel 1 (`TxD1`/`RxD1`).
+
+`IC450 S99-50082` is cross-referenced in Spansion material to the S71AL016D02 family, a 16-Mbit Flash + 2-Mbit SRAM MCP, i.e. a 2-MiB flash die.  The numerical match to the BOOT21 `0x200000` core-sized observation is important supporting evidence, but it still does not establish the record-to-physical-address map.
+
+A related CXR704060-based NW-HD3 service manual names `PK2/XBOOT` as a boot-mode selection input and shows that product's relevant I/O rail as +1.8 V.  That proves the signal's role in a closely related implementation, **not** the safe electrical level or strap procedure for NW-E405.  E405 XBOOT polarity, reset timing, pin rail, UART baud/protocol and ROM monitor behavior remain unverified.  No grounding/driving instruction should be issued until the E405 electrical path is resolved from its own schematic/measurement.
+
+### Revised recovery research priority
+
+The software path should now be exhausted in this order before moving to hardware boot mode:
+
+1. Preserve the existing v0.8.1 exact-state evidence (FB/A3/A4) without adding writes.
+2. Add the E405-native `SONYICD 0x01 GetTargetIdentifier` as a separately gated DATA-IN probe after its public/private logging design is finalized.
+3. Consider `SONYICD 0x02` and bounded standard status/capability reads only if `0x01` produces useful evidence.
+4. Continue mapping other E405-native application/service paths, but keep QuickFormat/Set/Reset operations disabled.
+5. Only if software vendor/service paths are exhausted, move to XBOOT/UART/boot-ROM research with measured electrical conditions first.
+
+This supersedes the earlier shortcut `FB + A3/A4 fail -> XBOOT`.
+
+## MP3 File Manager low-level cross-check: CopyTool + FrankPACAPI (2026-09-26)
+
+### CopyTool independently confirms the NW-E405 A3/A4 Device-ID sequence
+
+Static analysis of Sony MP3 File Manager's `CopyTool.exe` independently reproduces the same A3/A4 sequence previously known from the SonyDB capture/implementation. This is stronger evidence than relying on the third-party capture alone.
+
+`CopyTool.exe` builds the fixed outbound select command:
+
+`A3 00 00 00 00 00 00 BC 00 14 30 00`
+
+with exactly 20 bytes of outbound data beginning `00 12` and otherwise zero-filled in the observed construction. It then uses CopyTool's outbound SCSI transport. The subsequent read path builds:
+
+`A4 00 00 00 00 00 00 BC 00 12 3F 00`
+
+for 18 bytes DATA IN and retries the inbound transaction once if the first call fails. `tools/copytool_dvid_audit.py` pins these instructions without performing device I/O.
+
+### FrankPACAPI contains a second, larger A4/BC read command
+
+Sony's `FrankPACAPI.dll` (SHA-256 `1356a2a96235a3a4319ba0dbcb1b8ede4a21cb786f5ea7e3ff214bb56470a802`) contains exactly two uses of one 12-byte CDB-builder pattern. Both construct:
+
+`A4 00 00 00 00 00 00 BC 04 04 33 00`
+
+with `0x0404` (1028) bytes returned from the device and subcommand `0x33`. One path calls Frank's direct inbound command routine; the other is in Sony source path `koDeviceFormatFrankBehavior.cpp` and explicitly logs failures from `m_pclProtocol->ExecCommandIn()` and `m_pclProtocol->GetDeviceInfo()`. The Type Library independently names the API split as `ExecCommand`, `ExecCommandIn`, and `ExecCommandOut`, with parameters `ulCommandSize`, `pbyteCommand`, Sense/ASC/ASCQ, and device-to-host vs host-to-device data sizes/buffers. Therefore A4/BC/33 is firmly a DATA-IN/read-only query in Sony's implementation, not the format/erase action itself.
+
+In the direct implementation, the 1028-byte response starts at a local buffer whose byte at raw offset `0x0C` has bit 7 extracted and logged as `iDeviceMode`. A caller maps the resulting 0/1 value to Sony behavior types 2 or 4. This makes `A4 ... 33` a strong candidate for a device-mode/behavior query used to choose formatting/device behavior. The exact semantic label of every response field remains unknown.
+
+### ATRACAD2 ties the query to the NW-E405 family
+
+Frank's lower device class issues a standard 56-byte INQUIRY and parses the normal identification fields. In addition to Vendor/Product/Revision it extracts the 8-byte vendor-specific field at INQUIRY offset `0x24`. The Frank binary contains explicit family identifiers `ATRACHD1` and `ATRACAD2`.
+
+The path that precedes the A4/BC/33 query scans device indices and compares the extracted identification string against `ATRACAD2` before using the query. The real failed NW-E405 INQUIRY captured by this project contains `ATRACAD2` at that same vendor-specific region. This substantially strengthens the case that the A4/BC/33 query is applicable to the NW-E405/NWWM MEM AAD2 family rather than being an unrelated Hi-MD-only command.
+
+A separate `koDeviceFormatFrankBehavior.cpp` path first compares a normal `GetDeviceInfo` string against `ATRACHD1`; that family can be assigned one behavior directly, while the non-HD path falls through to the A4/BC/33 query. Separately, `koDeviceFormatFrankLocal.cpp` explicitly branches on `ATRACAD2` for local CID/SID handling. Sony therefore treats these strings as real device-family selectors internally.
+
+### Transport and current No-Media state
+
+Frank's Windows-NT path normally opens a drive-letter-style device (`\\.\\A:` template) and uses standard Windows SCSI pass-through (`IOCTL_SCSI_PASS_THROUGH_DIRECT`, `0x4D014`). An older/alternate path contains `\\.\\SONYSPTI`. The failed unit currently exposes no usable drive letter, so the original MP3 File Manager high-level path may never reach the command even if the device itself would accept it. The Recovery Tool, however, already opens the exact `SONY / NWWM MEM AAD2` disk interface directly, so a future bounded read-only A4/BC/33 compatibility probe can use the same standard SPTI transport without requiring a mounted volume.
+
+Frank's generic retry wrapper treats exact packed Sense `02/3A/00` (`Medium Not Present`) as a terminal/non-retryable condition, while some other NOT READY / UNIT ATTENTION conditions are retried. This confirms that Sony's normal media path regards the current state as a hard media-presentation failure; it does not establish that the separate A4/BC service query is blocked by that state.
+
+`tools/frank_a4_behavior_audit.py` pins the A4/33 construction, read-only transport evidence, response-bit extraction, behavior mapping, standard SPTI support, and 3A00 handling. No device I/O is performed by the audit.
