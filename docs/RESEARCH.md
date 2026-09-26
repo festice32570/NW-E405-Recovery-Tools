@@ -262,11 +262,13 @@ The recurring `+0x18` size is also notable.  Removing 24 bytes from the A600 BOO
 
 The official PC updater binaries do not contain the `UPGR_FMT` magic or E40X model identifier and do not expose an obvious package decrypt/decompress path; they copy the UPG as a file before `FC/04`.  The strongest current interpretation is therefore that UPG parsing/verification/transformation occurs on the player side.  That is another reason a modified PC updater is not, by itself, a No-Media force-flash transport.
 
-### Missing high-value comparison artifact: official E40X overseas package
+### E40X overseas package comparison recovered from Sony update infrastructure
 
-Sony's still-indexed support pages identify the overseas package as `NW-E40X_V2_0C.exe`, approximately 2239 KB / 2.19 MB.  The historical direct URL was `https://www.aii.co.jp/contents/smojsdmk/overseas/support/NW-E40X_V2_0C.exe`, but that endpoint is no longer serving the binary and current Sony regional pages expose an unusable/dead download flow in this environment.
+The overseas E40X package is no longer a missing artifact. The US `NW-E40X_V2_0C.EXE` was recovered directly from Sony's `hav.update.sony.net` update infrastructure and retained only in the private research tree. Its SHA-256 is `a38cc219405b0697c660bc2b58b464f4e2f2e9f1c9449adabcd127ee46db58e8`; the contained US package is `MSFWUPGR_NW-E40X_200C.UPG` (INI version 2.0.80.0, SHA-256 `a8901044a8314a80f4ad9c9b92f8b3789595d4af32c6ec84b3bd4cdc57941df4`). A separate European package contains `MSFWUPGR_NW-E40X_201C.UPG` (INI version 2.0.81.0, SHA-256 `b4057322f5112136b996bcd5695784b0665ce14daff30cbf85d003088aa0e12c`).
 
-A trusted copy of this exact official package remains a high-value research artifact: E40X-J versus E40X-C would separate region-dependent payload behavior without also changing the hardware family.  Do not substitute an unverified mirror merely to obtain a comparison sample.
+The EU 201C and Japanese 201J UPGs have identical records 1, 2 and 3 byte-for-byte. Their type-4 records have the same `0x1F8018` length and the same first eight bytes, then diverge without same-position 8-byte re-synchronization; record 5 also differs. The older US 200C package additionally has a shorter type-3 record (`0x10430` instead of `0x10518`) and diverges from the 201 packages after a common `0x750`-byte prefix. This makes record 3 look revision-dependent in the observed samples, while record 4 carries the stronger region/model-specific payload difference. Those are structural observations, not a decoded semantic map.
+
+Because valid official E40X variants do not all share the Japanese section lengths, `tools/upg_analyzer.py` now separates generic known-container validity from `japanese_layout_ok`. The exact Japanese recovery approval remains unchanged: model, Japanese layout, file size and the pinned Japanese SHA-256 must all match before `APPROVED_E40X_J` is true.
 
 ### Hardware boundary after software-path review
 
