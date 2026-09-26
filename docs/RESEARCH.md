@@ -85,7 +85,7 @@ The large payload regions have very high entropy. They may be encrypted, compres
 - `FC/09`: historical GetProductInfo-shaped data-in query using the INI signature `roga`, allocation length 24; ordinary Diagnostics still records it for continuity with earlier reports.
 - authentic E40X `FC/05+roga`: **not sent by ordinary Diagnostics**. v0.8.3 exposes it only as separately gated Recovery Stage 2D after fresh Issue #1 revalidation and explicit confirmation. Exact CDB is `FC 00 05 72 6F 67 61 00 00 10 00 00`, DATA IN 16.
 
-The current main branch does not contain `FC/04`, SCSI DATA OUT, or standard SCSI write opcodes.
+The current Recovery Ladder source contains exactly one explicit SCSI DATA OUT implementation: the fixed A3 Device-ID select. It also contains exactly one FC/04 update-start builder behind the existing root-package / free-space / official-firmware / current-state safety gates and double confirmation. Standard SCSI WRITE opcodes remain absent. Stage 2D FC/05+`roga` itself is DATA IN only and has no path to DATA OUT or FC/04.
 
 
 ## v0.6 No-Media logical rescue
@@ -353,6 +353,6 @@ For ClassifyType 1..3, `FWUpdaterCom.dll` copies the 16-byte response directly t
 
 Sony's original direct SPTI implementation requests 16 bytes but does not enforce the returned `DataTransferLength`. v0.8.3 is intentionally stricter: success requires IOCTL success, SCSI GOOD, returned DataTransferLength exactly 16, and 16 bytes copied. Zero length, short 1..15, over-length, CHECK CONDITION, non-GOOD status, and IOCTL failure are all rejected with no retry or follow-up vendor command.
 
-Stage 2D is isolated from ordinary Diagnostics. It performs its own fresh `INQUIRY + TUR + READ CAPACITY + FC/03` Issue #1 preflight. After that passes, a separate explicit confirmation shows the exact CDB and DATA-IN length before the one-shot send. Failure or decline terminates Stage 2D without DATA OUT, FC/04, or another vendor command.
+Stage 2D is isolated from ordinary Diagnostics and is now offered first when LBA0 is unreadable, ahead of the legacy Stage 2A/2B/2C research probes. If the user accepts the outer Stage 2D prompt, the tool performs its own fresh `INQUIRY + TUR + READ CAPACITY + FC/03` Issue #1 preflight and, if that passes, a separate explicit confirmation shows the exact CDB and DATA-IN length before the one-shot send. After entering Stage 2D, the tool saves PUBLIC_REPORT and ends the Recovery Ladder regardless of probe success/failure or the final confirmation outcome; it does not fall through to 2A/2B/2C. Only declining the initial Stage 2D prompt allows the legacy probe group to be offered. Stage 2D itself has no DATA OUT, FC/04, retry, or follow-up vendor-command path.
 
 A complete 16-byte response is treated as PRIVATE device-specific `pbDeviceId` material regardless of content. All-zero and partially-zero values are transport-complete if the transport conditions pass, but no device-side semantic meaning is assigned. Raw 16 bytes and the first 6 continuity bytes are never written to PUBLIC_REPORT. A complete response is saved as `NW-E405_FC05_DEVICEID_PRIVATE_<session>.bin`; PUBLIC_REPORT exposes only probe/preflight state, IOCTL/Win32, SCSI/sense, requested/actual length, and SHA-256 after a complete successful response.

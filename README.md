@@ -3,6 +3,7 @@
 v0.8.3-devは、v0.8.2でordinary Diagnosticsから誤って送っていたsignature-less FC/05を撤去し、Sony純正E40X `ClassifyType=3` の正規GetDeviceId queryを独立したRecovery Stage 2Dとして実装した研究版です。
 
 - ordinary DiagnosticsはFC/05を送信しない。従来どおりFC/03とhistorical FC/09+`roga` read queryのみ
+- LBA0 unreadable時はStage番号に関係なくauthentic Stage 2Dをlegacy Stage 2A/2B/2Cより先に提示する。Stage 2Dへ進んだ場合は結果に関係なくPUBLIC_REPORTを保存してRecovery Ladderを終了し、2A/2B/2Cへ自動fall-throughしない。Stage 2Dを最初の確認で拒否した場合だけlegacy probe群を提示する
 - Stage 2D exact CDB: `FC 00 05 72 6F 67 61 00 00 10 00 00`
 - directionはDATA INのみ、要求長は16 bytes
 - Stage 2D直前に `INQUIRY + TUR + READ CAPACITY + FC/03` をfresh revalidationし、Issue #1状態から外れていればFC/05を送信しない
@@ -81,7 +82,7 @@ GitHub Issueへ添付するのは **`NW-E405_PUBLIC_REPORT_*.txt` だけ**にし
 
 ## 過去版: v0.6.1-dev — No Media Rescue / Forensic
 
-v0.6.1-devはNo Media救出経路を確立した読み取り専用の過去版です。現在はv0.7-devを推奨します。
+v0.6.1-devはNo Media救出経路を確立した読み取り専用の過去版です。現在の研究開発版はv0.8.3-devです。
 
 > **重要:** v0.6.1-devはまだ「強制フラッシュ版」ではありません。MSVCの例外テーブルまで含めて純正Updaterを再監査した結果、`CopyFileA` が失敗した場合は例外ハンドラで `SendFWUpdateCommand` が中止され、`FC/04` へ進まないことを確認しました。一方、純正GUIが99%待機へ入るのは `SendFWUpdateCommand` が成功した後です。Issue #1ではUPGコピーとFC/04開始までは成功し、その後の本体側更新または再起動・再列挙で失敗した可能性が高いと見ています。v0.4-devの単純なFC/04再送は、この失敗を繰り返す可能性があるため撤回したままです。
 
@@ -143,7 +144,7 @@ Issue #1の実機ログと完全一致した場合だけ「No Media救出」ボ�
 
 これにより、正常な別個体がなくても「公式UPGが完全な状態で残っている」「UPG候補はあるが破損している」「論理NAND自体がREAD(10)で読めない」を切り分けられます。
 
-すべてのデバイスアクセスはDATA INまたはno-dataの読み取り/問い合わせで、`FC/04`、SCSI DATA OUT、WRITE(10/12)、WRITE BUFFERは含みません。
+**過去版v0.6.1-devでは**、すべてのデバイスアクセスはDATA INまたはno-dataの読み取り/問い合わせで、`FC/04`、SCSI DATA OUT、WRITE(10/12)、WRITE BUFFERを含みませんでした。現行v0.8.3-devの安全境界は冒頭の仕様を参照してください。
 
 ### v0.6.1-devで絶対に行わないこと
 
@@ -212,7 +213,7 @@ Issue #1の実機ログと完全一致した場合だけ「No Media救出」ボ�
 
 この変更により、次回ログでは「旧Sony/PCD scsipath層が存在しない」「存在するがNW-E405へ到達しない」「到達するがFC/03のみ拒否される」を切り分けやすくなりました。
 
-**引き続きSCSI DATA OUT経路と `0xFC/0x04` 更新開始コマンドは含まれていません。**
+**過去版v0.3.1-devにはSCSI DATA OUT経路と `0xFC/0x04` 更新開始コマンドは含まれていませんでした。**
 
 ## v0.3-dev: scsipath診断
 
@@ -222,7 +223,7 @@ v0.2.1-devの実機ログでは、通常のDisk interface経由でSCSI INQUIRY�
 
 v0.3-devでは、正しいNW-E405 USB ID (`054C:01FB`) が存在する場合に限り、`scsipath0..25` を開いて標準SCSI INQUIRYを実行します。`SONY / NWWM MEM AAD2` が確認できたパスだけで、読み取り系Sony `0xFC/0x03` を再テストします。
 
-**SCSI DATA OUT経路および `0xFC/0x04` 更新開始コマンドはこの版にも含まれていません。**
+**過去版v0.3-devにもSCSI DATA OUT経路および `0xFC/0x04` 更新開始コマンドは含まれていませんでした。**
 
 ## 機種判定の検証
 
@@ -334,7 +335,7 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 ## Disclaimer
 
-開発中の実験ツールです。現在のmain/v0.6.1-devは読み取り専用です。書き込み系復旧機能は、No Media状態での安全なfirmware transportまたはROM/service protocolを確認し、実機検証できるまでmainへ戻しません。
+開発中の実験ツールです。現行Recovery Ladder系コードには、固定A3 selectのDATA OUT実装が1種類だけ存在し、FC/04 update-startも厳格な既存safety gateの後ろに1実装だけ存在します。標準SCSI WRITE系CDB、任意DATA OUT、format/eraseは実装していません。v0.8.3 Stage 2D FC/05+`roga`自身はDATA IN 16 bytesのみで、DATA OUTやFC/04へ自動で繋がりません。
 
 ---
 
@@ -342,4 +343,4 @@ Sony公式ファームウェア、UPGファイル、純正Updaterバイナリそ
 
 Experimental recovery research for Sony NW-E405 units stuck at **MEMORY ERROR / No Media** after a failed firmware update.
 
-**v0.6.1-dev is a read-only Windows 7 No-Media rescue/forensic build. The earlier v0.4 FC/04 resume experiment was withdrawn and its release/tag deleted after a control-flow re-audit. v0.6.1 adds gated No-Media LBA0 rescue, FAT/MBR imaging, recovered-UPG comparison, and stricter MBR/BPB bounds while remaining device-side read-only.**
+**Historical v0.6.1-dev was a read-only Windows 7 No-Media rescue/forensic build. The earlier v0.4 FC/04 resume experiment was withdrawn and its release/tag deleted after a control-flow re-audit. v0.6.1 adds gated No-Media LBA0 rescue, FAT/MBR imaging, recovered-UPG comparison, and stricter MBR/BPB bounds while remaining device-side read-only.**

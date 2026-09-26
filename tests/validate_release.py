@@ -16,6 +16,8 @@ checks={
  'probe state reporting':'ATTEMPTED-FAILED' in s and 'DECLINED' in s and 'NOT ATTEMPTED' in s,
  'public SCSI summaries':'LBA0 READ(10) result' in s and 'FB/PW_STAT SCSI result' in s and 'A3 fixed select SCSI result' in s and 'A4 Device-ID read SCSI result' in s and 'SONYICD 0x01 SCSI result' in s and 'E40X FC/05+roga SCSI result' in s and 'Requested=%lu Actual=%lu' in s,
  'stage2 live revalidation':'Stage 2A live preflight' in s and 'Stage 2B live preflight' in s and 'Stage 2C live preflight' in s and 'Stage 2D live preflight' in s and 'identity=%s TUR3A00=%s CAP3A00=%s FC03-known=%s' in s,
+ 'Stage2D priority before legacy probes':s.index('int fc05ans=MessageBoxW') < s.index('int fbans=MessageBoxW') < s.index('int a3ans=MessageBoxW') < s.index('int icdans=MessageBoxW'),
+ 'Stage2D selection terminates before legacy fallthrough':'if(fc05ans==IDYES){ProbeE40xFc05DeviceId();SavePublicReport();return;}' in s and 'Stage 2D was declined before preflight. Legacy Stage 2A/2B/2C research probes may now be offered separately.' in s,
  'public-only upload rule':'PUBLIC upload rule: attach only this NW-E405_PUBLIC_REPORT_*.txt' in s and 'TXT/JSONLと一緒にIssue #1へ添付してください' not in s,
  'fixed A3 CDB':'0xA3,0,0,0,0,0,0,0xBC,0,0x14,0x30,0' in s,
  'fixed A3 payload':'BYTE payload[20]={0}; payload[1]=0x12;' in s,

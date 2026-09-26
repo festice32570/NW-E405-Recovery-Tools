@@ -1551,6 +1551,11 @@ static void RunRecoveryLadder(void) {
         if(g_rootPackageIntact&&g_resumeEligible&&g_officialFirmwareVerified){if(MessageBoxW(g_hwnd,L"救出したMSFWUPGR.UPGが公式v2.0と完全一致し、更新再開条件も通りました。\n続けてFC/04更新再開を試しますか？",L"Recovery Stage 3 available",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)ResumeVerifiedUpdate();return;}
     }
     if(g_lba0Unreadable){
+        int fc05ans=MessageBoxW(g_hwnd,L"READ(10)でLBA0も読めませんでした。\n\n次の実機確認では、Sony純正E40X ClassifyType=3の正規GetDeviceId経路を最優先で確認します。\n\n正規CDBは FC 00 05 72 6F 67 61 00 00 10 00 00、DATA IN 16 bytesです。\n送信前にIssue #1状態をfresh preflightで再確認し、通過後にも最終送信確認を表示します。\n\nraw 16 bytesはPRIVATE扱いで、serial numberとは決めつけません。PUBLIC_REPORTにはSCSI結果・要求/実転送長・完全成功時のSHA-256だけを記録します。\n\nStage 2Dのpreflightへ進みますか？",L"Recovery Stage 2D - authentic E40X FC/05+roga",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
+        if(fc05ans==IDYES){ProbeE40xFc05DeviceId();SavePublicReport();return;}
+        g_fc05DeviceIdState=PROBE_DECLINED;g_stage2dPreflightState=PROBE_NOT_ATTEMPTED;g_fc05DeviceIdRead=FALSE;g_fc05DeviceIdSha256[0]=0;ZeroMemory(&g_pubStage2dPreflight,sizeof(g_pubStage2dPreflight));ZeroMemory(&g_pubFc05DeviceId,sizeof(g_pubFc05DeviceId));
+        SavePublicReport();
+        LogF(L"Stage 2D was declined before preflight. Legacy Stage 2A/2B/2C research probes may now be offered separately.");
         int fbans=MessageBoxW(g_hwnd,L"READ(10)でLBA0も読めませんでした。\n\n次に同世代Sony NW-A600公式Updaterで確認した読み取り専用vendor queryを2本だけ試せます。\n・FB/PW_STAT: DATA IN 32 bytes\n・FB/DEVINFO: DATA IN 128 bytes\n\nNW-E405純正Updaterにはこの拡張機能は無いため互換性は未確認です。PCから本体へdata payloadは送りません。\n\n試しますか？",L"Recovery Stage 2A - Sony FB read probes",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
         if(fbans==IDYES)ProbeA600ReadOnlyVendorInfo();
         else {g_fbPwStatState=PROBE_DECLINED;g_fbDevInfoState=PROBE_DECLINED;g_stage2aPreflightState=PROBE_NOT_ATTEMPTED;ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight));ZeroMemory(&g_pubFbPwStat,sizeof(g_pubFbPwStat));ZeroMemory(&g_pubFbDevInfo,sizeof(g_pubFbDevInfo));}
@@ -1560,9 +1565,6 @@ static void RunRecoveryLadder(void) {
         SavePublicReport();
         int icdans=MessageBoxW(g_hwnd,L"次に、Sony MP3 File ManagerのNW-E405世代純正IcdMSCom.dll由来の読み取り専用SONYICD 0x01 GetTargetIdentifierを1回だけ試せます。\n\n固定CDBで116バイト(DATA IN)だけを要求し、本体へdata payloadは送りません。応答には個体情報が含まれる可能性があるため、生データはPRIVATE保存し、PUBLIC_REPORTにはSCSI結果・アプリstatus byte・SHA-256だけを記録します。\n\n試しますか？",L"Recovery Stage 2C - E405 SONYICD read probe",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
         if(icdans==IDYES)ProbeSonyIcdTargetIdentifier(); else {g_sonyIcdTargetState=PROBE_DECLINED;g_stage2cPreflightState=PROBE_NOT_ATTEMPTED;g_sonyIcdResponseRead=FALSE;g_sonyIcdStatusValid=FALSE;ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight));ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget));}
-        SavePublicReport();
-        int fc05ans=MessageBoxW(g_hwnd,L"次にSony純正E40X ClassifyType=3の正規GetDeviceId経路を独立して確認できます。\n\n正規CDBは FC 00 05 72 6F 67 61 00 00 10 00 00、DATA IN 16 bytesです。\n送信前にIssue #1状態をfresh preflightで再確認し、通過後にも最終送信確認を表示します。\n\nraw 16 bytesはPRIVATE扱いで、serial numberとは決めつけません。PUBLIC_REPORTにはSCSI結果・要求/実転送長・完全成功時のSHA-256だけを記録します。\n\nStage 2Dのpreflightへ進みますか？",L"Recovery Stage 2D - authentic E40X FC/05+roga",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
-        if(fc05ans==IDYES)ProbeE40xFc05DeviceId(); else {g_fc05DeviceIdState=PROBE_DECLINED;g_stage2dPreflightState=PROBE_NOT_ATTEMPTED;g_fc05DeviceIdRead=FALSE;g_fc05DeviceIdSha256[0]=0;ZeroMemory(&g_pubStage2dPreflight,sizeof(g_pubStage2dPreflight));ZeroMemory(&g_pubFc05DeviceId,sizeof(g_pubFc05DeviceId));}
         SavePublicReport();return;
     }
     LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();

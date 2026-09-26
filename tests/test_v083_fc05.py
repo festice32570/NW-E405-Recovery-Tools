@@ -3,6 +3,8 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 SRC=(ROOT/"src/NW-E405-Recovery-Tool.c").read_text(encoding="utf-8")
 README=(ROOT/"README.md").read_text(encoding="utf-8")
+BUILD=(ROOT/"BUILD.md").read_text(encoding="utf-8")
+RESEARCH=(ROOT/"docs/RESEARCH.md").read_text(encoding="utf-8")
 
 def func(name):
     marker=f"static void {name}("
@@ -13,6 +15,7 @@ def func(name):
 FC05=func("ProbeE40xFc05DeviceId")
 DIAG=SRC[SRC.index("static BOOL ProbeDiskInterface("):SRC.index("\nstatic int EnumerateDisks(")]
 REPORT=func("SavePublicReport")
+RUN=func("RunRecoveryLadder")
 
 def test_fc05_exact_12_byte_cdb_and_data_in_16():
     exact="static const BYTE cdb[12]={0xFC,0x00,0x05,0x72,0x6F,0x67,0x61,0x00,0x00,0x10,0x00,0x00};"
@@ -69,6 +72,36 @@ def test_fc04_gate_is_unchanged_and_not_reachable_from_fc05_probe():
     assert "RevalidateIssue1BeforeWrite" in SRC
     assert "SendCdb(h,cdb,12,0)" in SRC
     assert "ResumeVerifiedUpdate(" not in FC05
+
+def test_stage2d_is_offered_before_legacy_stage2a_2b_2c():
+    assert RUN.index("int fc05ans=MessageBoxW") < RUN.index("int fbans=MessageBoxW")
+    assert RUN.index("int fc05ans=MessageBoxW") < RUN.index("int a3ans=MessageBoxW")
+    assert RUN.index("int fc05ans=MessageBoxW") < RUN.index("int icdans=MessageBoxW")
+
+
+def test_stage2d_selection_terminates_ladder_without_legacy_fallthrough():
+    assert "if(fc05ans==IDYES){ProbeE40xFc05DeviceId();SavePublicReport();return;}" in RUN
+    yes_end=RUN.index("if(fc05ans==IDYES){ProbeE40xFc05DeviceId();SavePublicReport();return;}")
+    assert RUN.index("int fbans=MessageBoxW") > yes_end
+
+
+def test_legacy_stage2_probes_are_only_after_stage2d_outer_decline():
+    decline="g_fc05DeviceIdState=PROBE_DECLINED;g_stage2dPreflightState=PROBE_NOT_ATTEMPTED"
+    assert decline in RUN
+    assert RUN.index(decline) < RUN.index("int fbans=MessageBoxW")
+    assert "Stage 2D was declined before preflight. Legacy Stage 2A/2B/2C research probes may now be offered separately." in RUN
+
+
+def test_current_safety_docs_match_allowed_a3_and_gated_fc04():
+    assert "The current main branch does not contain `FC/04`, SCSI DATA OUT" not in RESEARCH
+    assert "exactly one explicit SCSI DATA OUT implementation: the fixed A3 Device-ID select" in RESEARCH
+    assert "exactly one FC/04 update-start builder" in RESEARCH
+    assert "Stage 2D FC/05+`roga` itself is DATA IN only" in RESEARCH
+    assert "release validation rejects SCSI DATA OUT, FC/04" not in BUILD
+    assert "permits exactly one explicit DATA OUT implementation" in BUILD
+    assert "exactly one existing gated FC/04 builder" in BUILD
+    assert "現在のmain/v0.6.1-devは読み取り専用です" not in README
+
 
 def test_v082_signatureless_result_is_preserved_as_history():
     assert "signature-less CDB `FC 00 05 00 00 00 00 00 00 10 00 00`" in README

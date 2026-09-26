@@ -19,7 +19,7 @@ i686-w64-mingw32-clang \
   -lcomdlg32 -ladvapi32
 ```
 
-The manifest requests administrator privileges because Windows may require them for SCSI pass-through. This permission does not imply media writes; release validation rejects SCSI DATA OUT, FC/04 and standard SCSI WRITE opcodes.
+The manifest requests administrator privileges because Windows may require them for SCSI pass-through. This permission does not imply unrestricted media writes. Release validation permits exactly one explicit DATA OUT implementation (the fixed A3 Device-ID select) and exactly one existing gated FC/04 builder, rejects any additional DATA OUT or FC/04 builder, and rejects standard SCSI WRITE opcodes.
 
 ## Validation
 
