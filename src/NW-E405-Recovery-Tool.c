@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.7-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.8-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -60,6 +60,15 @@ static BOOL g_resumeEligible = FALSE;
 static BOOL g_vendorDvIdRead = FALSE;
 static BYTE g_vendorDvId[16] = {0};
 static WCHAR g_vendorDvIdSha256[65] = {0};
+typedef enum { PROBE_NOT_ATTEMPTED=0, PROBE_DECLINED=1, PROBE_FAILED=2, PROBE_SUCCESS=3 } ProbeState;
+typedef enum { A3A4_NOT_ATTEMPTED=0, A3A4_DECLINED=1, A3A4_FAILED=2, A3A4_SUCCESS=3 } A3A4State;
+static ProbeState g_fbPwStatState = PROBE_NOT_ATTEMPTED;
+static ProbeState g_fbDevInfoState = PROBE_NOT_ATTEMPTED;
+static A3A4State g_a3a4State = A3A4_NOT_ATTEMPTED;
+static BOOL g_fbPwStatOk = FALSE;
+static BOOL g_fbDevInfoOk = FALSE;
+static WCHAR g_fbPwStatSha256[65] = {0};
+static WCHAR g_fbDevInfoSha256[65] = {0};
 static uint64_t g_rescueFreeBytes = 0;
 static BOOL g_rescueFreeKnown = FALSE;
 static WCHAR g_publicReportPath[MAX_PATH] = {0};
@@ -286,6 +295,8 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
 }
 
 
+static void ShowScsiResult(const WCHAR *name, const ScsiResult *r);
+
 static ScsiResult SendFixedA3SelectDeviceId(HANDLE h) {
     ScsiResult r; ZeroMemory(&r,sizeof(r)); r.opened=TRUE;
     static const BYTE cdb[12]={0xA3,0,0,0,0,0,0,0xBC,0,0x14,0x30,0};
@@ -315,7 +326,50 @@ static BOOL Sha256BytesHex(const BYTE *data, DWORD len, WCHAR out[65]) {
     if(hash)CryptDestroyHash(hash);CryptReleaseContext(prov,0);return ok;
 }
 
+static BOOL SavePrivateBlob(const WCHAR *tag, const BYTE *data, DWORD len, WCHAR hashOut[65]) {
+    if(!data || !len || !hashOut) return FALSE;
+    if(!Sha256BytesHex(data,len,hashOut)) return FALSE;
+    WCHAR path[MAX_PATH];
+    _snwprintf(path,MAX_PATH-1,L"%s\\NW-E405_%s_PRIVATE_%s.bin",g_exeDir,tag,g_sessionStem);
+    HANDLE out=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
+    if(out==INVALID_HANDLE_VALUE){LogF(L"PRIVATE %s evidence save failed: %lu",tag,GetLastError());return FALSE;}
+    DWORD wr=0; BOOL ok=WriteFile(out,data,len,&wr,NULL)&&wr==len;
+    if(ok)FlushFileBuffers(out);CloseHandle(out);
+    if(ok)LogF(L"PRIVATE %s evidence saved: %s (SHA-256 %s)",tag,path,hashOut);
+    return ok;
+}
+
+static void ProbeA600ReadOnlyVendorInfo(void) {
+    g_fbPwStatOk=FALSE;g_fbDevInfoOk=FALSE;g_fbPwStatState=PROBE_NOT_ATTEMPTED;g_fbDevInfoState=PROBE_NOT_ATTEMPTED;g_fbPwStatSha256[0]=0;g_fbDevInfoSha256[0]=0;
+    if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
+        LogF(L"FB vendor read probe locked: Issue #1 state is not currently established.");return;
+    }
+    HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL);
+    if(h==INVALID_HANDLE_VALUE){LogF(L"FB vendor read probe: device open failed %lu",GetLastError());return;}
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2A: same-generation Sony read-only vendor probes ===");
+    LogF(L"Experimental compatibility probe only: commands are proven from Sony NW-A600 FWUpdaterCom.dll, not from the NW-E405 updater.");
+    LogF(L"Both commands are DATA IN only. No payload is sent to the player.");
+    BYTE pwCdb[12]={0xFB,0,0,'P','W','_','S','T','A','T',0x20,0};
+    g_fbPwStatState=PROBE_FAILED;
+    ScsiResult pw=SendCdb(h,pwCdb,12,32);
+    ShowScsiResult(L"SONY FB/PW_STAT (A600 read-only compatibility probe)",&pw);
+    if(pw.ioctlOk&&pw.scsiStatus==0&&pw.dataLen>=32){
+        g_fbPwStatOk=TRUE;g_fbPwStatState=PROBE_SUCCESS;SavePrivateBlob(L"FB_PWSTAT",pw.data,32,g_fbPwStatSha256);
+    }else LogF(L"FB/PW_STAT unsupported or failed on this device; no retry/write action follows.");
+    BYTE diCdb[12]={0xFB,0,0,'D','E','V','I','N','F','O',0x80,0};
+    g_fbDevInfoState=PROBE_FAILED;
+    ScsiResult di=SendCdb(h,diCdb,12,128);
+    ShowScsiResult(L"SONY FB/DEVINFO (A600 read-only compatibility probe)",&di);
+    if(di.ioctlOk&&di.scsiStatus==0&&di.dataLen>=128){
+        g_fbDevInfoOk=TRUE;g_fbDevInfoState=PROBE_SUCCESS;SavePrivateBlob(L"FB_DEVINFO",di.data,128,g_fbDevInfoSha256);
+    }else LogF(L"FB/DEVINFO unsupported or failed on this device; no retry/write action follows.");
+    CloseHandle(h);
+    LogF(L"FB compatibility result: PW_STAT=%s DEVINFO=%s",g_fbPwStatOk?L"GOOD":L"NO",g_fbDevInfoOk?L"GOOD":L"NO");
+}
+
 static BOOL QueryVendorDvId(void) {
+    g_a3a4State=A3A4_FAILED;
     if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
         LogF(L"A3/A4 vendor query locked: Issue #1 state is not currently established."); return FALSE;
     }
@@ -331,7 +385,7 @@ static BOOL QueryVendorDvId(void) {
     LogF(L"A4 read: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X DataLen=%lu",rd.ioctlOk?L"OK":L"FAIL",rd.scsiStatus,rd.sense[12],rd.sense[13],rd.dataLen);
     if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.dataLen<18 || rd.data[0]!=0x00 || rd.data[1]!=0x10){LogF(L"A4 response did not match the expected 00 10 + 16-byte record shape.");return FALSE;}
     BOOL nz=FALSE;for(int i=2;i<18;i++)if(rd.data[i])nz=TRUE;if(!nz){LogF(L"A4 returned an all-zero Device-ID record.");return FALSE;}
-    CopyMemory(g_vendorDvId,rd.data+2,16);g_vendorDvIdRead=TRUE;Sha256BytesHex(g_vendorDvId,16,g_vendorDvIdSha256);
+    CopyMemory(g_vendorDvId,rd.data+2,16);g_vendorDvIdRead=TRUE;g_a3a4State=A3A4_SUCCESS;Sha256BytesHex(g_vendorDvId,16,g_vendorDvIdSha256);
     WCHAR path[MAX_PATH];_snwprintf(path,MAX_PATH-1,L"%s\\NW-E405_DvID_PRIVATE_%s.bin",g_exeDir,g_sessionStem);
     HANDLE out=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
     if(out!=INVALID_HANDLE_VALUE){DWORD wr=0;WriteFile(out,g_vendorDvId,16,&wr,NULL);FlushFileBuffers(out);CloseHandle(out);}
@@ -1193,7 +1247,7 @@ static void SavePublicReport(void) {
     HANDLE h=CreateFileW(g_publicReportPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
     if(h==INVALID_HANDLE_VALUE)return;
     DWORD wr=0;BYTE bom[3]={0xEF,0xBB,0xBF};WriteFile(h,bom,3,&wr,NULL);
-    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.7-dev - PUBLIC REPORT");
+    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8-dev - PUBLIC REPORT");
     WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID, image sectors, music data, or full vendor responses.");
     WCHAR b[512];
     _snwprintf(b,511,L"Exact USB/SCSI identity: %s",g_exactDevicePath[0]?L"YES":L"NO");WriteUtf8Line(h,b);
@@ -1201,10 +1255,19 @@ static void SavePublicReport(void) {
     _snwprintf(b,511,L"READ CAPACITY Medium Not Present 3A00: %s",g_issue1CapNoMedia?L"YES":L"NO");WriteUtf8Line(h,b);
     _snwprintf(b,511,L"Known FC/03 1.x response: %s",g_issue1FwInfoMatch?L"YES":L"NO");WriteUtf8Line(h,b);
     _snwprintf(b,511,L"LBA0 unreadable: %s",g_lba0Unreadable?L"YES":L"NO");WriteUtf8Line(h,b);
-    _snwprintf(b,511,L"Root MSFWUPGR.UPG exact official match: %s",g_rootPackageIntact?L"YES":L"NO");WriteUtf8Line(h,b);
+    if(g_lba0Unreadable) WriteUtf8Line(h,L"Root MSFWUPGR.UPG exact official match: NOT CHECKED (LBA0 unreadable)");
+    else {_snwprintf(b,511,L"Root MSFWUPGR.UPG exact official match: %s",g_rootPackageIntact?L"YES":L"NO");WriteUtf8Line(h,b);}
     if(g_rescueFreeKnown){_snwprintf(b,511,L"Rescued FAT current free bytes: %I64u",g_rescueFreeBytes);WriteUtf8Line(h,b);}
-    _snwprintf(b,511,L"Recovery resume eligibility: %s",g_resumeEligible?L"YES":L"NO");WriteUtf8Line(h,b);
-    _snwprintf(b,511,L"A3/A4 Device-ID query: %s",g_vendorDvIdRead?L"SUCCESS":L"NOT ACQUIRED");WriteUtf8Line(h,b);
+    if(g_lba0Unreadable) WriteUtf8Line(h,L"Recovery resume eligibility: NOT EVALUABLE (logical media unreadable)");
+    else {_snwprintf(b,511,L"Recovery resume eligibility: %s",g_resumeEligible?L"YES":L"NO");WriteUtf8Line(h,b);}
+    const WCHAR *pwState=(g_fbPwStatState==PROBE_SUCCESS)?L"SUCCESS":(g_fbPwStatState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbPwStatState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
+    const WCHAR *diState=(g_fbDevInfoState==PROBE_SUCCESS)?L"SUCCESS":(g_fbDevInfoState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbDevInfoState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
+    const WCHAR *a3State=(g_a3a4State==A3A4_SUCCESS)?L"SUCCESS":(g_a3a4State==A3A4_FAILED)?L"ATTEMPTED-FAILED":(g_a3a4State==A3A4_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
+    _snwprintf(b,511,L"FB/PW_STAT read-only compatibility probe: %s",pwState);WriteUtf8Line(h,b);
+    if(g_fbPwStatOk){_snwprintf(b,511,L"FB/PW_STAT response SHA-256 only: %s",g_fbPwStatSha256);WriteUtf8Line(h,b);}
+    _snwprintf(b,511,L"FB/DEVINFO read-only compatibility probe: %s",diState);WriteUtf8Line(h,b);
+    if(g_fbDevInfoOk){_snwprintf(b,511,L"FB/DEVINFO response SHA-256 only: %s",g_fbDevInfoSha256);WriteUtf8Line(h,b);}
+    _snwprintf(b,511,L"A3/A4 Device-ID query: %s",a3State);WriteUtf8Line(h,b);
     if(g_vendorDvIdRead){_snwprintf(b,511,L"Device-ID SHA-256 only: %s",g_vendorDvIdSha256);WriteUtf8Line(h,b);}
     WriteUtf8Line(h,L"PRIVATE: JSONL trace, metadata.bin, DvID bin, LBA/IMG, recovered UPG. Do NOT attach those to a public issue unless intentionally sharing their contents.");
     FlushFileBuffers(h);CloseHandle(h);
@@ -1272,7 +1335,12 @@ static void RunRecoveryLadder(void) {
         if(g_rootPackageIntact&&g_resumeEligible&&g_officialFirmwareVerified){if(MessageBoxW(g_hwnd,L"救出したMSFWUPGR.UPGが公式v2.0と完全一致し、更新再開条件も通りました。\n続けてFC/04更新再開を試しますか？",L"Recovery Stage 3 available",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)ResumeVerifiedUpdate();return;}
     }
     if(g_lba0Unreadable){
-        if(MessageBoxW(g_hwnd,L"通常のREAD(10)経路ではLBA0も読めませんでした。\n\n次にSony MP3 File ManagerのNW-E405実機キャプチャ由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2 - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)==IDYES)QueryVendorDvId();
+        int fbans=MessageBoxW(g_hwnd,L"READ(10)でLBA0も読めませんでした。\n\n次に同世代Sony NW-A600公式Updaterで確認した読み取り専用vendor queryを2本だけ試せます。\n・FB/PW_STAT: DATA IN 32 bytes\n・FB/DEVINFO: DATA IN 128 bytes\n\nNW-E405純正Updaterにはこの拡張機能は無いため互換性は未確認です。PCから本体へdata payloadは送りません。\n\n試しますか？",L"Recovery Stage 2A - Sony FB read probes",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
+        if(fbans==IDYES)ProbeA600ReadOnlyVendorInfo();
+        else {g_fbPwStatState=PROBE_DECLINED;g_fbDevInfoState=PROBE_DECLINED;}
+        SavePublicReport();
+        int a3ans=MessageBoxW(g_hwnd,L"通常のREAD(10)経路ではLBA0も読めませんでした。\n\n同世代NW-A600純正Updater由来のread-only FB/PW_STAT・FB/DEVINFO互換性確認を実行しました。\n\n次にSony MP3 File ManagerのNW-E405純正実装由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2 - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
+        if(a3ans==IDYES)QueryVendorDvId(); else g_a3a4State=A3A4_DECLINED;
         SavePublicReport();return;
     }
     LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();
@@ -1318,7 +1386,7 @@ static void RunDiagnostics(void) {
     g_noMediaRescueAvailable=FALSE; g_exactDevicePath[0]=0;
     g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
     g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
-    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
+    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0; g_fbPwStatOk=FALSE; g_fbDevInfoOk=FALSE; g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");

@@ -1,3 +1,16 @@
+## GUI版 v0.8-dev — Vendor Read Probes after LBA0 failure
+
+v0.8-devは、v0.7実機ログで `READ CAPACITY=3A00` に加えて `READ(10) LBA0` も読めなかった個体向けの次段研究版です。v0.7のRecovery Ladderを維持したまま、LBA0失敗後に次の段階を追加します。
+
+- Sony NW-A600公式Updater由来の `FB/PW_STAT` (DATA IN 32 bytes) と `FB/DEVINFO` (DATA IN 128 bytes) を、明示確認後に関連機種互換性プローブとして実行
+- その後、NW-E405実機Sony MP3 File Manager通信由来の固定A3/A4 Device-ID queryを別確認で実行
+- PUBLIC REPORTは各段階を `NOT ATTEMPTED / DECLINED / ATTEMPTED-FAILED / SUCCESS` で区別
+- LBA0が読めない場合、UPGを「不一致」と誤表示せず `NOT CHECKED`、FC/04適格性も `NOT EVALUABLE` と表示
+
+A600のFW/UPG/PBRデータをNW-E405へ書き込む機能はありません。追加したFBコマンドは2本ともDATA INで、標準SCSI WRITE系コマンドは実装していません。
+
+---
+
 # NW-E405 Recovery Tools
 
 > 🚧 **Work in progress / 開発中**
