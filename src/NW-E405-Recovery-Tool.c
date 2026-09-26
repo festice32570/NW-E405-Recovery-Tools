@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.8.1-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.8.2-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -84,17 +84,25 @@ static ProbeState g_fbDevInfoState = PROBE_NOT_ATTEMPTED;
 static A3A4State g_a3a4State = A3A4_NOT_ATTEMPTED;
 static ProbeState g_stage2aPreflightState = PROBE_NOT_ATTEMPTED;
 static ProbeState g_stage2bPreflightState = PROBE_NOT_ATTEMPTED;
+static ProbeState g_stage2cPreflightState = PROBE_NOT_ATTEMPTED;
+static ProbeState g_sonyIcdTargetState = PROBE_NOT_ATTEMPTED;
 static PublicScsiSummary g_pubLba0 = {0};
 static PublicScsiSummary g_pubFbPwStat = {0};
 static PublicScsiSummary g_pubFbDevInfo = {0};
 static PublicScsiSummary g_pubA3 = {0};
 static PublicScsiSummary g_pubA4 = {0};
+static PublicScsiSummary g_pubSonyIcdTarget = {0};
 static PublicPreflightSummary g_pubStage2aPreflight = {0};
 static PublicPreflightSummary g_pubStage2bPreflight = {0};
+static PublicPreflightSummary g_pubStage2cPreflight = {0};
 static BOOL g_fbPwStatOk = FALSE;
 static BOOL g_fbDevInfoOk = FALSE;
 static WCHAR g_fbPwStatSha256[65] = {0};
 static WCHAR g_fbDevInfoSha256[65] = {0};
+static BOOL g_sonyIcdResponseRead = FALSE;
+static BOOL g_sonyIcdStatusValid = FALSE;
+static BYTE g_sonyIcdStatus = 0;
+static WCHAR g_sonyIcdTargetSha256[65] = {0};
 static uint64_t g_rescueFreeBytes = 0;
 static BOOL g_rescueFreeKnown = FALSE;
 static WCHAR g_publicReportPath[MAX_PATH] = {0};
@@ -320,9 +328,11 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
     r.winErr = ok ? ERROR_SUCCESS : GetLastError();
     r.scsiStatus = pkt.sptd.ScsiStatus;
     CopyMemory(r.sense, pkt.sense, sizeof(r.sense));
-    if (data && dataLen) {
-        CopyMemory(r.data, data, dataLen);
-        r.dataLen = dataLen;
+    if (data && dataLen && ok) {
+        DWORD actualLen = pkt.sptd.DataTransferLength;
+        if (actualLen > dataLen) actualLen = dataLen;
+        CopyMemory(r.data, data, actualLen);
+        r.dataLen = actualLen;
     }
     if (data) HeapFree(GetProcessHeap(), 0, data);
     TraceCdbJson(&r);
@@ -445,6 +455,38 @@ static BOOL QueryVendorDvId(void) {
     LogF(L"PRIVATE evidence saved: %s",path);
     LogF(L"Do NOT post the private DvID file or raw JSONL trace to a public GitHub issue.");
     return TRUE;
+}
+
+static void ProbeSonyIcdTargetIdentifier(void) {
+    g_sonyIcdTargetState=PROBE_NOT_ATTEMPTED;g_stage2cPreflightState=PROBE_NOT_ATTEMPTED;
+    g_sonyIcdResponseRead=FALSE;g_sonyIcdStatusValid=FALSE;g_sonyIcdStatus=0;g_sonyIcdTargetSha256[0]=0;
+    ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget));ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight));
+    if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
+        LogF(L"SONYICD 0x01 probe locked: Issue #1 state is not currently established.");return;
+    }
+    g_stage2cPreflightState=PROBE_FAILED;
+    HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL);
+    if(h==INVALID_HANDLE_VALUE){LogF(L"SONYICD 0x01: device open failed %lu",GetLastError());return;}
+    if(!RevalidateIssue1State(h,L"Stage 2C live preflight",&g_pubStage2cPreflight)){LogF(L"Stage 2C aborted: live Issue #1 state no longer matches.");CloseHandle(h);return;}
+    g_stage2cPreflightState=PROBE_SUCCESS;g_sonyIcdTargetState=PROBE_FAILED;
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2C: E405-native SONYICD GetTargetIdentifier ===");
+    LogF(L"Fixed CDB from Sony MP3 File Manager IcdMSCom.dll; DATA IN 0x74 bytes only. No payload is sent to the player.");
+    LogF(L"Raw response is PRIVATE. No identifier strings or decoded fields are written to the public report.");
+    BYTE cdb[12]={0xFC,0,0x01,'S','O','N','Y','I','C','D',0x00,0x74};
+    ScsiResult rd=SendCdb(h,cdb,12,0x74);CapturePublicScsiSummary(&g_pubSonyIcdTarget,&rd);CloseHandle(h);
+    ShowScsiResult(L"SONYICD 0x01 GetTargetIdentifier (E405-native read-only probe)",&rd);
+    if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.dataLen!=0x74){
+        LogF(L"SONYICD 0x01 did not return a complete 0x74-byte SCSI-GOOD response; no response fields are interpreted and no retry/write action follows.");return;
+    }
+    g_sonyIcdResponseRead=TRUE;g_sonyIcdStatusValid=TRUE;g_sonyIcdStatus=rd.data[0x0F];
+    SavePrivateBlob(L"SONYICD_TARGETID",rd.data,0x74,g_sonyIcdTargetSha256);
+    LogF(L"SONYICD 0x01 complete response received. Device status byte[0x0F]=0x%02X; response SHA-256=%s",g_sonyIcdStatus,g_sonyIcdTargetSha256);
+    if(g_sonyIcdStatus==0){
+        g_sonyIcdTargetState=PROBE_SUCCESS;
+        LogF(L"SONYICD application status is zero. Raw/decoded identifier fields remain private and are not displayed.");
+    }else{
+        LogF(L"SONYICD application status is nonzero; Sony's original code returns this status without parsing identifier fields.");
+    }
 }
 
 static void TraceCdbIntentJson(const ScsiResult *r) {
@@ -1322,8 +1364,8 @@ static void SavePublicReport(void) {
     HANDLE h=CreateFileW(g_publicReportPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
     if(h==INVALID_HANDLE_VALUE)return;
     DWORD wr=0;BYTE bom[3]={0xEF,0xBB,0xBF};WriteFile(h,bom,3,&wr,NULL);
-    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8.1-dev - PUBLIC REPORT");
-    WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID, image sectors, music data, or full vendor responses.");
+    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8.2-dev - PUBLIC REPORT");
+    WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID/SONYICD response, image sectors, music data, or full vendor responses.");
     WCHAR b[512];
     _snwprintf(b,511,L"Exact USB/SCSI identity: %s",g_exactDevicePath[0]?L"YES":L"NO");WriteUtf8Line(h,b);
     _snwprintf(b,511,L"TUR Medium Not Present 3A00: %s",g_issue1TurNoMedia?L"YES":L"NO");WriteUtf8Line(h,b);
@@ -1340,6 +1382,7 @@ static void SavePublicReport(void) {
     const WCHAR *pwState=(g_fbPwStatState==PROBE_SUCCESS)?L"SUCCESS":(g_fbPwStatState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbPwStatState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
     const WCHAR *diState=(g_fbDevInfoState==PROBE_SUCCESS)?L"SUCCESS":(g_fbDevInfoState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbDevInfoState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
     const WCHAR *a3State=(g_a3a4State==A3A4_SUCCESS)?L"SUCCESS":(g_a3a4State==A3A4_FAILED)?L"ATTEMPTED-FAILED":(g_a3a4State==A3A4_DECLINED)?L"DECLINED":(g_a3a4State==A3A4_BLOCKED_PREFLIGHT)?L"BLOCKED-PREFLIGHT":L"NOT ATTEMPTED";
+    const WCHAR *icdState=(g_sonyIcdTargetState==PROBE_SUCCESS)?L"SUCCESS":(g_sonyIcdTargetState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_sonyIcdTargetState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
     WritePublicPreflightSummary(h,L"Stage 2A live state preflight",g_stage2aPreflightState,&g_pubStage2aPreflight);
     _snwprintf(b,511,L"FB/PW_STAT read-only compatibility probe: %s",pwState);WriteUtf8Line(h,b);
     WritePublicScsiSummary(h,L"FB/PW_STAT SCSI result",&g_pubFbPwStat);
@@ -1352,8 +1395,13 @@ static void SavePublicReport(void) {
     WritePublicScsiSummary(h,L"A3 fixed select SCSI result",&g_pubA3);
     WritePublicScsiSummary(h,L"A4 Device-ID read SCSI result",&g_pubA4);
     if(g_vendorDvIdRead){_snwprintf(b,511,L"Device-ID SHA-256 only: %s",g_vendorDvIdSha256);WriteUtf8Line(h,b);}
+    WritePublicPreflightSummary(h,L"Stage 2C live state preflight",g_stage2cPreflightState,&g_pubStage2cPreflight);
+    _snwprintf(b,511,L"SONYICD 0x01 GetTargetIdentifier read-only probe: %s",icdState);WriteUtf8Line(h,b);
+    WritePublicScsiSummary(h,L"SONYICD 0x01 SCSI result",&g_pubSonyIcdTarget);
+    if(g_sonyIcdStatusValid){_snwprintf(b,511,L"SONYICD 0x01 application status byte: 0x%02X",g_sonyIcdStatus);WriteUtf8Line(h,b);}
+    if(g_sonyIcdResponseRead&&g_sonyIcdTargetSha256[0]){_snwprintf(b,511,L"SONYICD 0x01 response SHA-256 only: %s",g_sonyIcdTargetSha256);WriteUtf8Line(h,b);}
     WriteUtf8Line(h,L"PUBLIC upload rule: attach only this NW-E405_PUBLIC_REPORT_*.txt to GitHub Issue #1.");
-    WriteUtf8Line(h,L"PRIVATE: TXT journal, JSONL trace, metadata.bin, DvID/FB blobs, LBA/IMG, recovered UPG. Do NOT attach these to the public issue.");
+    WriteUtf8Line(h,L"PRIVATE: TXT journal, JSONL trace, metadata.bin, DvID/FB/SONYICD blobs, LBA/IMG, recovered UPG. Do NOT attach these to the public issue.");
     FlushFileBuffers(h);CloseHandle(h);
 }
 
@@ -1430,6 +1478,9 @@ static void RunRecoveryLadder(void) {
         SavePublicReport();
         int a3ans=MessageBoxW(g_hwnd,L"通常のREAD(10)経路ではLBA0も読めませんでした。\n\n同世代NW-A600純正Updater由来のread-only FB/PW_STAT・FB/DEVINFO互換性確認を実行しました。\n\n次にSony MP3 File ManagerのNW-E405純正実装由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2 - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
         if(a3ans==IDYES)QueryVendorDvId(); else {g_a3a4State=A3A4_DECLINED;g_stage2bPreflightState=PROBE_NOT_ATTEMPTED;ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight));ZeroMemory(&g_pubA3,sizeof(g_pubA3));ZeroMemory(&g_pubA4,sizeof(g_pubA4));}
+        SavePublicReport();
+        int icdans=MessageBoxW(g_hwnd,L"次に、Sony MP3 File ManagerのNW-E405世代純正IcdMSCom.dll由来の読み取り専用SONYICD 0x01 GetTargetIdentifierを1回だけ試せます。\n\n固定CDBで116バイト(DATA IN)だけを要求し、本体へdata payloadは送りません。応答には個体情報が含まれる可能性があるため、生データはPRIVATE保存し、PUBLIC_REPORTにはSCSI結果・アプリstatus byte・SHA-256だけを記録します。\n\n試しますか？",L"Recovery Stage 2C - E405 SONYICD read probe",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
+        if(icdans==IDYES)ProbeSonyIcdTargetIdentifier(); else {g_sonyIcdTargetState=PROBE_DECLINED;g_stage2cPreflightState=PROBE_NOT_ATTEMPTED;g_sonyIcdResponseRead=FALSE;g_sonyIcdStatusValid=FALSE;ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight));ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget));}
         SavePublicReport();return;
     }
     LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();
@@ -1477,10 +1528,10 @@ static void RunDiagnostics(void) {
     g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
     g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0;
     g_fbPwStatOk=FALSE; g_fbDevInfoOk=FALSE; g_fbPwStatState=PROBE_NOT_ATTEMPTED; g_fbDevInfoState=PROBE_NOT_ATTEMPTED;
-    g_stage2aPreflightState=PROBE_NOT_ATTEMPTED; g_stage2bPreflightState=PROBE_NOT_ATTEMPTED; g_a3a4State=A3A4_NOT_ATTEMPTED;
+    g_stage2aPreflightState=PROBE_NOT_ATTEMPTED; g_stage2bPreflightState=PROBE_NOT_ATTEMPTED; g_stage2cPreflightState=PROBE_NOT_ATTEMPTED; g_a3a4State=A3A4_NOT_ATTEMPTED; g_sonyIcdTargetState=PROBE_NOT_ATTEMPTED;
     ZeroMemory(&g_pubLba0,sizeof(g_pubLba0)); ZeroMemory(&g_pubFbPwStat,sizeof(g_pubFbPwStat)); ZeroMemory(&g_pubFbDevInfo,sizeof(g_pubFbDevInfo));
-    ZeroMemory(&g_pubA3,sizeof(g_pubA3)); ZeroMemory(&g_pubA4,sizeof(g_pubA4)); ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight)); ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight));
-    g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
+    ZeroMemory(&g_pubA3,sizeof(g_pubA3)); ZeroMemory(&g_pubA4,sizeof(g_pubA4)); ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget)); ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight)); ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight)); ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight));
+    g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_sonyIcdResponseRead=FALSE; g_sonyIcdStatusValid=FALSE; g_sonyIcdStatus=0; g_sonyIcdTargetSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");
@@ -1491,7 +1542,7 @@ static void RunDiagnostics(void) {
     SetStatus(L"診断中... USBを抜かないでください");
 
     LogF(L"%s", APP_TITLE);
-    LogF(L"Diagnostic stage is READ-ONLY. Recovery Ladder may later unlock exactly one fixed A3 select or a gated FC/04 resume after explicit confirmation.");
+    LogF(L"Diagnostic stage is READ-ONLY. Recovery Ladder may later unlock read-only vendor probes, exactly one fixed A3 select, or a gated FC/04 resume after explicit confirmation.");
     LogHostEnvironment();
     LogF(L"");
     LogF(L"診断ボタン自体はフォーマット、セクタ書込み、FW書込み、FC/04更新開始を実行しません。");

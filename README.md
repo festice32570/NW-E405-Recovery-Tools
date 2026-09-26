@@ -1,17 +1,19 @@
-## GUI版 v0.8.1-dev — Public-report-complete Vendor Read Probes
+## GUI版 v0.8.2-dev — E405-native SONYICD Read Probe
 
-v0.8.1-devは、v0.7実機ログで `READ CAPACITY=3A00` に加えて `READ(10) LBA0` も読めなかった個体向けの次段研究版です。v0.7のRecovery Ladderを維持したまま、LBA0失敗後に次の段階を追加します。
+v0.8.2-devは、v0.8.1のStage 2A/2Bを維持したまま、Sony MP3 File ManagerのNW-E405世代純正 `IcdMSCom.dll` から静的に確認した `SONYICD 0x01 GetTargetIdentifier` をStage 2Cとして追加した研究版です。
 
-- Sony NW-A600公式Updater由来の `FB/PW_STAT` (DATA IN 32 bytes) と `FB/DEVINFO` (DATA IN 128 bytes) を、明示確認後に関連機種互換性プローブとして実行
-- その後、NW-E405実機Sony MP3 File Manager通信由来の固定A3/A4 Device-ID queryを別確認で実行
-- PUBLIC REPORTは各段階を `NOT ATTEMPTED / DECLINED / ATTEMPTED-FAILED / SUCCESS` で区別
-- PUBLIC REPORTへ各SCSI失敗の `IOCTL / Win32 / SCSI status / Sense Key-ASC-ASCQ` を安全な要約として記録
-- Stage 2A / 2B直前に `INQUIRY + TUR + READ CAPACITY + FC/03` で現在状態を再確認し、結果を公開レポートへ記録
-- A3 selectとA4 readを別々に記録し、A3失敗時にA4が送られていないことを判別可能
-- 公開Issueへ添付するのは `NW-E405_PUBLIC_REPORT_*.txt` **だけ**。TXT/JSONL/IMG/UPG/DvID/FB blobはPRIVATE
-- LBA0が読めない場合、UPGを「不一致」と誤表示せず `NOT CHECKED`、FC/04適格性も `NOT EVALUABLE` と表示
+- Stage 2A: Sony NW-A600公式Updater由来の `FB/PW_STAT` (DATA IN 32 bytes) / `FB/DEVINFO` (DATA IN 128 bytes)
+- Stage 2B: NW-E405純正MP3 File Manager由来の固定A3/A4 Device-ID query
+- Stage 2C: 固定CDB `FC 00 01 53 4F 4E 59 49 43 44 00 74`、DATA IN 116 bytesの `GetTargetIdentifier`
+- Stage 2C直前にも `INQUIRY + TUR + READ CAPACITY + FC/03` を再確認し、Issue #1既知状態から外れていれば送信しない
+- Windows SPTIが返した実転送長を確認し、SCSI GOODかつ116 bytes完全受信時だけ `response[0x0F]` のSony application statusを解釈
+- Sony純正コード同様、statusが非0なら識別子フィールドを解析しない。statusが0でも本ツールは文字列・個体情報をPUBLICへ展開しない
+- 生の116-byte SONYICD応答はPRIVATE保存。PUBLIC REPORTはSCSI要約、status byte、SHA-256だけ
+- `SONYICD Set 0x41..0x45` と `Reset 0x80` は実装しない
+- FrankPACAPIの `A4/BC/33` (1028-byte DATA IN) は引き続きstatic研究のみで、v0.8.2には入れない
+- 公開Issueへ添付するのは `NW-E405_PUBLIC_REPORT_*.txt` **だけ**。TXT/JSONL/IMG/UPG/DvID/FB/SONYICD blobはPRIVATE
 
-A600のFW/UPG/PBRデータをNW-E405へ書き込む機能はありません。追加したFBコマンドは2本ともDATA INで、標準SCSI WRITE系コマンドは実装していません。
+A600のFW/UPG/PBRデータをNW-E405へ書き込む機能はありません。標準SCSI WRITE系コマンドも実装していません。DATA OUT実装は従来どおり固定A3 selectの1種類だけです。
 
 ---
 

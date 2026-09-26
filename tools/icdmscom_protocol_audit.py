@@ -6,13 +6,16 @@ Research aid only. Does not send commands to a device.
 from pathlib import Path
 import argparse, hashlib, subprocess, re
 
+EXPECTED_SHA256='1a2994dbdd0ac414b081033fb6a90024e1913382a57389c260a1c173f5eadaf4'
+
 def check(ok,msg):
     print(('PASS' if ok else 'FAIL'),msg)
     if not ok: raise SystemExit(1)
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('dll',type=Path); a=ap.parse_args()
-    b=a.dll.read_bytes(); print('sha256',hashlib.sha256(b).hexdigest())
+    b=a.dll.read_bytes(); sha=hashlib.sha256(b).hexdigest(); print('sha256',sha)
+    check(sha==EXPECTED_SHA256,'exact analyzed IcdMSCom.dll hash')
     dis=subprocess.check_output(['objdump','-d','-Mintel',str(a.dll)],text=True,errors='ignore')
     # Generic builder signature: FC 00 <cmd> 'SONYICD' <len-be16>
     for addr,frag in [
@@ -62,11 +65,18 @@ def main():
     check('ff 50 08' in dis and 'ff 50 0c' in dis and 'ff 52 04' in dis,
           'SONYICD family dispatch reaches IN/OUT/no-data virtual transports')
 
-    # GetTargetIdentifier validates response byte +0x0f and then parses
-    # network-order fields with ntohs/ntohl.  Keep raw 0x74 bytes private.
-    check('8a 41 0f' in dis, 'GetTargetIdentifier status byte at response+0x0F')
-    check('8b 35 28 a1 00 10' in dis and '8b 3d 2c a1 00 10' in dis,
-          'GetTargetIdentifier ntohs/ntohl field decoding evidence')
+    # GetTargetIdentifier requests exactly command 0x01 / 0x74 bytes, then
+    # validates response byte +0x0f before parsing any identifier fields.
+    target=dis[dis.find('10003460:'):dis.find('10003637:')]
+    check('100034eb:\t6a 74' in target and '100034ee:\t6a 01' in target,
+          'GetTargetIdentifier exact cmd=0x01 len=0x74 call evidence')
+    check('100034f0:\te8 3b f5 ff ff' in target and '100034f5:\t84 c0' in target,
+          'GetTargetIdentifier transport failure is checked before response parsing')
+    check('1000351a:\te8 21 01 00 00' in target and '10003521:\t85 f6' in target and '10003523:\t74 1b' in target,
+          'GetTargetIdentifier nonzero device status returns before field parsing')
+    check('8a 41 0f' in dis, 'shared SONYICD status helper reads response+0x0F')
+    check('8b 35 28 a1 00 10' in target and '8b 3d 2c a1 00 10' in target,
+          'GetTargetIdentifier ntohs/ntohl field decoding occurs only after zero status')
 
     raw=a.dll.read_bytes()
     check(b'\\.\\SONYSPTI\x00' in raw, 'SONYSPTI backend string present')

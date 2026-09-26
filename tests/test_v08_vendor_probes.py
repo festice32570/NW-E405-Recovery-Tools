@@ -53,3 +53,28 @@ def test_public_issue_instruction_never_requests_private_logs():
     assert "TXT/JSONLと一緒にIssue #1へ添付してください" not in SRC
     assert "PUBLIC upload rule: attach only this NW-E405_PUBLIC_REPORT_*.txt" in SRC
     assert "Do NOT attach these to the public issue" in SRC
+
+
+def test_sonyicd_target_exact_read_only_cdb():
+    assert "BYTE cdb[12]={0xFC,0,0x01,'S','O','N','Y','I','C','D',0x00,0x74};" in SRC
+    assert "SendCdb(h,cdb,12,0x74)" in SRC
+    assert "rd.dataLen!=0x74" in SRC
+
+def test_sonyicd_target_is_separately_gated_and_revalidated():
+    assert "Recovery Stage 2C - E405 SONYICD read probe" in SRC
+    assert 'RevalidateIssue1State(h,L"Stage 2C live preflight",&g_pubStage2cPreflight)' in SRC
+    assert "MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2" in SRC
+
+def test_sonyicd_public_report_keeps_raw_response_private():
+    assert "SONYICD 0x01 application status byte" in SRC
+    assert "SONYICD 0x01 response SHA-256 only" in SRC
+    assert "No identifier strings or decoded fields are written to the public report." in SRC
+    assert 'SavePrivateBlob(L"SONYICD_TARGETID"' in SRC
+
+def test_sonyicd_set_and_reset_commands_are_not_live_probes():
+    for cmd in ("0x41","0x42","0x43","0x44","0x45","0x80"):
+        assert f"{{0xFC,0,{cmd},'S','O','N','Y','I','C','D'" not in SRC
+
+def test_data_in_result_uses_actual_sptd_transfer_length():
+    assert "DWORD actualLen = pkt.sptd.DataTransferLength;" in SRC
+    assert "r.dataLen = actualLen;" in SRC

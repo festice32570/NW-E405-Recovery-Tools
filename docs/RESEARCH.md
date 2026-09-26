@@ -282,11 +282,11 @@ A related CXR704060-based NW-HD3 service manual names `PK2/XBOOT` as a boot-mode
 
 The software path should now be exhausted in this order before moving to hardware boot mode:
 
-1. Preserve the existing v0.8.1 exact-state evidence (FB/A3/A4) without adding writes.
-2. Add the E405-native `SONYICD 0x01 GetTargetIdentifier` as a separately gated DATA-IN probe after its public/private logging design is finalized.
-3. Consider `SONYICD 0x02` and bounded standard status/capability reads only if `0x01` produces useful evidence.
-4. Continue mapping other E405-native application/service paths, but keep QuickFormat/Set/Reset operations disabled.
-5. Only if software vendor/service paths are exhausted, move to XBOOT/UART/boot-ROM research with measured electrical conditions first.
+1. Use v0.8.2 to preserve the existing Stage 2A/2B evidence and add the separately gated E405-native `SONYICD 0x01 GetTargetIdentifier` DATA-IN result.
+2. Interpret the private 0x01 response only after the real unit result is available; public reporting remains status/hash only.
+3. Consider `SONYICD 0x02` only if 0x01 establishes that the SONYICD service path is alive and the extra information has a concrete recovery purpose.
+4. Keep FrankPACAPI `A4/BC/33` static-only until/unless a 1028-byte transport extension is justified by the preceding results; keep QuickFormat/Set/Reset operations disabled.
+5. Only if the remaining software vendor/service paths are exhausted, move to XBOOT/UART/boot-ROM research with measured electrical conditions first.
 
 This supersedes the earlier shortcut `FB + A3/A4 fail -> XBOOT`.
 
@@ -331,3 +331,14 @@ Frank's Windows-NT path normally opens a drive-letter-style device (`\\.\\A:` te
 Frank's generic retry wrapper treats exact packed Sense `02/3A/00` (`Medium Not Present`) as a terminal/non-retryable condition, while some other NOT READY / UNIT ATTENTION conditions are retried. This confirms that Sony's normal media path regards the current state as a hard media-presentation failure; it does not establish that the separate A4/BC service query is blocked by that state.
 
 `tools/frank_a4_behavior_audit.py` pins the A4/33 construction, read-only transport evidence, response-bit extraction, behavior mapping, standard SPTI support, and 3A00 handling. No device I/O is performed by the audit.
+
+
+## v0.8.2 decision: E405-native SONYICD 0x01 becomes Stage 2C (2026-09-26)
+
+The next live read-only probe is now selected: `SONYICD 0x01 GetTargetIdentifier`, not FrankPACAPI `A4/BC/33`. The choice is based on bounded implementation evidence rather than probe count. `0x01` is from the E405-era Sony MP3 File Manager itself, uses the already-confirmed standard SPTI DATA-IN path, requests only `0x74` (116) bytes, and fits the Recovery Tool's existing 128-byte response buffer without transport redesign. The Frank A4/BC/33 query remains useful static evidence but returns 1028 bytes and is tied to format-behavior selection, so it stays deferred.
+
+Static control-flow evidence in `IcdMSCom.dll` now pins the important failure semantics. `GetTargetIdentifier` first checks the generic transport call. After a transport success it reads `response[0x0F]`; any nonzero application status is returned before Sony's identifier/string/numeric field parser runs. Field decoding occurs only when that status is zero. `tools/icdmscom_protocol_audit.py` now asserts this ordering in addition to command, length, direction and SPTI evidence.
+
+Stage 2C therefore sends exactly `FC 00 01 53 4F 4E 59 49 43 44 00 74` once, DATA IN only, after its own explicit user confirmation and fresh Issue #1 state preflight. The transport now records the returned `SCSI_PASS_THROUGH_DIRECT.DataTransferLength`; application status is inspected only for SCSI GOOD plus an exact 116-byte transfer. A complete raw response is written only to a PRIVATE blob. The public report exposes the SCSI summary, one-byte Sony application status and response SHA-256, never the strings or decoded identifier fields.
+
+No `SONYICD Set 0x41..0x45`, `Reset 0x80`, format/erase, standard SCSI WRITE, or arbitrary DATA OUT path was added. The only explicit DATA OUT implementation remains the pre-existing fixed A3 select. The separately gated FC/04 recovery-resume path is unchanged.
