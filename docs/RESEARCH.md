@@ -176,3 +176,33 @@ This closes the ordinary logical-media rescue branch for the current device stat
 Two v0.7 public-report fields were semantically ambiguous and must not be over-interpreted. `Root MSFWUPGR.UPG exact official match: NO` did not mean a compared package mismatched; the package was never reachable because LBA0 could not be read. `A3/A4 Device-ID query: NOT ACQUIRED` did not distinguish user decline, no attempt, A3 failure, or A4 failure.
 
 v0.8.1-dev addresses this evidence gap without requiring private logs to be posted publicly. The PUBLIC_REPORT records safe command-result summaries (`IOCTL`, Win32 status, SCSI status and Sense Key/ASC/ASCQ), distinguishes A3 and A4, records Stage 2A/2B live-state preflight components, and uses explicit NOT CHECKED / NOT EVALUABLE wording when logical media is unreadable. Raw responses and private evidence remain excluded from the public report.
+
+## Firmware-package / failed-unit cross-check (2026-09-26)
+
+The v0.7 real-device result (`TUR=3A00`, `READ CAPACITY=3A00`, direct LBA0 `READ(10)` unreadable, known FC/03 still alive) was cross-checked against the official E40X/E50X/A600 UPG structures and Sony MP3 File Manager binaries.
+
+### UPG record comparison
+
+The E40X Japanese v2.0 package uses descriptors `(1,0x50) (2,0x30) (3,0x10518) (4,0x1F8018) (5,0x4)`. E50X has the same lengths; records 2 and 3 are byte-for-byte identical to E40X, while record 4 differs after an eight-byte common prefix. This is evidence that some packaged component(s) are shared between E40X/E50X while the large type-4 record is substantially model-specific. The exact physical flash mapping is not yet decoded.
+
+A600 provides a boot-version contrast. A normal `BootstrapVersion=2.1` device selects a package whose large descriptor is `(type 4, 0x1F8018)`. The `BootstrapVersion=2.0` entry explicitly selects `NW_A600_2.00.00J_BOOT21.UPG`, whose corresponding descriptor is `(type 6, 0x200018)`. The length difference is exactly `0x8000` (32 KiB); subtracting `0x18` from the record lengths yields `0x1F8000` versus exactly `0x200000` (2 MiB). This strongly suggests a relationship between the BOOT-aware package and a full 2 MiB flash-sized image, while the normal package excludes a 32 KiB region. It does **not** yet prove exact physical addresses, that type 6 literally means "bootloader", or the transformation/encryption layout of the high-entropy payload.
+
+This makes the failed E405 state consistent with a layered failure: enough boot/control code survives to enumerate USB, answer SCSI/FC03 and display `MEMORY ERROR`, while logical-media initialization fails before a sector can be exposed. It does not prove the entire NOR is intact or that the NAND itself is physically damaged. The still-1.x FC03 response is evidence that final version/commit state was not advanced, not proof that every main-firmware byte remained at v1.0.
+
+### Sony MP3 File Manager IcdMSCom vendor family
+
+Reverse engineering of the official MP3 File Manager `IcdMSCom.dll` found a generic vendor CDB builder:
+
+`FC 00 <command> 53 4F 4E 59 49 43 44 <length_be16>` (`FC 00 <command> "SONYICD" <length>`).
+
+The command's top two bits select one of three transport methods. Named call sites establish the semantics strongly:
+
+- `0x00` family: Get/read path. `0x01 GetTargetIdentifier` (0x74 bytes), `0x02 GetPreferenceInfo` (0x48 bytes), `0x04/0x05 GetRevokeListST` (0x1F8 bytes each).
+- `0x40` family: Set/data-out path. `0x41 SetUserNameDevice`, `0x42 SetPreferenceMenu`, `0x43 SetUniqueID`, `0x44/0x45 SetRevokeListST`.
+- `0x80`: `Reset`, no data payload.
+
+This proves that the E405-era Sony software contains a richer vendor-command family beyond the already known A3/A4 and updater FC03/04/05/09 commands. The read-family commands are high-value candidates for a future safe recovery probe, but they are **not yet enabled in the Recovery Tool**. Raw returned identifiers/DRM structures may be device-unique and must remain private; a future public report should expose only status/Sense and hashes or non-identifying decoded fields.
+
+The MP3 File Manager `FrankPACAPI.dll` also contains `_CFrankFileSystem_StartQuickFmt`, FAT/no-filesystem medium enums, and Quick/Full erase frameworks. Current static analysis shows the QuickFormat worker is layered through filesystem/format helper structures and does not yet prove a No-Media-bypassing raw flash command. Therefore QuickFormat must not be invoked on the failed unit until its lower transport is mapped and its destructive operations are separated from read-only/status operations.
+
+Updated software-recovery research order after this cross-check: (1) current v0.8.1 read-only FB + A3/A4 evidence, (2) map and cautiously add proven read-only `SONYICD` Get commands, (3) finish FrankPACAPI QuickFormat/device-control transport analysis, then (4) XBOOT/boot-ROM only if the software service paths are exhausted. The earlier shortcut "FB+A3/A4 fail -> XBOOT" was premature.
