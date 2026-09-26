@@ -1,19 +1,22 @@
-## GUI版 v0.8.2-dev — E405-native SONYICD Read Probe
+## GUI版 v0.8.3-dev — Authentic E40X FC/05+roga GetDeviceId Probe
 
-v0.8.2-devは、v0.8.1のStage 2A/2Bを維持したまま、Sony MP3 File ManagerのNW-E405世代純正 `IcdMSCom.dll` から静的に確認した `SONYICD 0x01 GetTargetIdentifier` をStage 2Cとして追加した研究版です。
+v0.8.3-devは、v0.8.2でordinary Diagnosticsから誤って送っていたsignature-less FC/05を撤去し、Sony純正E40X `ClassifyType=3` の正規GetDeviceId queryを独立したRecovery Stage 2Dとして実装した研究版です。
 
-- Stage 2A: Sony NW-A600公式Updater由来の `FB/PW_STAT` (DATA IN 32 bytes) / `FB/DEVINFO` (DATA IN 128 bytes)
-- Stage 2B: NW-E405純正MP3 File Manager由来の固定A3/A4 Device-ID query
-- Stage 2C: 固定CDB `FC 00 01 53 4F 4E 59 49 43 44 00 74`、DATA IN 116 bytesの `GetTargetIdentifier`
-- Stage 2C直前にも `INQUIRY + TUR + READ CAPACITY + FC/03` を再確認し、Issue #1既知状態から外れていれば送信しない
-- Windows SPTIが返した実転送長を確認し、SCSI GOODかつ116 bytes完全受信時だけ `response[0x0F]` のSony application statusを解釈
-- Sony純正コード同様、statusが非0なら識別子フィールドを解析しない。statusが0でも本ツールは文字列・個体情報をPUBLICへ展開しない
-- 生の116-byte SONYICD応答はPRIVATE保存。PUBLIC REPORTはSCSI要約、status byte、SHA-256だけ
-- `SONYICD Set 0x41..0x45` と `Reset 0x80` は実装しない
-- FrankPACAPIの `A4/BC/33` (1028-byte DATA IN) は引き続きstatic研究のみで、v0.8.2には入れない
-- 公開Issueへ添付するのは `NW-E405_PUBLIC_REPORT_*.txt` **だけ**。TXT/JSONL/IMG/UPG/DvID/FB/SONYICD blobはPRIVATE
+- ordinary DiagnosticsはFC/05を送信しない。従来どおりFC/03とhistorical FC/09+`roga` read queryのみ
+- Stage 2D exact CDB: `FC 00 05 72 6F 67 61 00 00 10 00 00`
+- directionはDATA INのみ、要求長は16 bytes
+- Stage 2D直前に `INQUIRY + TUR + READ CAPACITY + FC/03` をfresh revalidationし、Issue #1状態から外れていればFC/05を送信しない
+- preflight通過後にも別の明示確認を出し、送信は1回だけ。retry・DATA OUT・FC/04・follow-up vendor commandは自動送信しない
+- 成功条件は `IOCTL OK && SCSI GOOD && returned DataTransferLength == 16 && copied length == 16`
+- 0-byte、1～15-byte、over-length、CHECK CONDITION、non-GOOD、IOCTL failureはすべて失敗扱い
+- 完全16-byte GOODだけを `NW-E405_FC05_DEVICEID_PRIVATE_<session>.bin` としてPRIVATE保存し、PUBLIC_REPORTにはraw/first-6/decoded値を出さず、SCSI要約・要求/実転送長・成功時SHA-256だけを記録
+- Sony API上の名称は `pbDeviceId`。E40X updaterが更新前後のcontinuity確認に使うのは先頭6 bytesだが、16 bytesをserial numberとは決めつけない
+- all-zero / partially-zeroな完全16-byte responseはtransport-completeとして扱うが、device-side semantic meaningは付与しない
+- Stage 2A/2B/2C、SONYICD Set/Reset禁止、format/erase禁止、standard SCSI WRITE禁止、fixed A3以外のDATA OUT禁止、FC/04 safety gateは維持
 
-A600のFW/UPG/PBRデータをNW-E405へ書き込む機能はありません。標準SCSI WRITE系コマンドも実装していません。DATA OUT実装は従来どおり固定A3 selectの1種類だけです。
+**v0.8.2履歴:** v0.8.2のsignature-less CDB `FC 00 05 00 00 00 00 00 00 10 00 00` は実機で `05/20/00`、actual length 0でした。この結果は正規FC/05+`roga`のsupport/unsupportedを示しません。v0.8.3の正規queryは別物として扱います。
+
+公開Issueへ添付するのは `NW-E405_PUBLIC_REPORT_*.txt` **だけ**です。TXT/JSONL/metadata/IMG/UPG/FC05_DEVICEID/DvID/FB/SONYICD blobはPRIVATEです。
 
 ---
 
@@ -28,7 +31,7 @@ A600のFW/UPG/PBRデータをNW-E405へ書き込む機能はありません。�
 
 ## GUI版 v0.7-dev — Recovery Ladder
 
-現在の推奨開発版は **`NW-E405-Recovery-Tool.exe` v0.7-dev** です。Windows 7 x64では32-bit Win32アプリとしてWoW64で動作し、.NET / PowerShell / Pythonは不要です。
+現在の研究開発版は **`NW-E405-Recovery-Tool.exe` v0.8.3-dev** です。Windows 7 x64では32-bit Win32アプリとしてWoW64で動作し、.NET / PowerShell / Pythonは不要です。
 
 v0.7は「診断だけ」ではなく、Issue #1の既知状態と一致した場合に**段階的な復旧アクション**へ進みます。
 
@@ -94,8 +97,8 @@ Windows 7でも起動できる32-bitネイティブWin32 GUIです。64-bit Wind
    - `REQUEST SENSE`
    - `READ CAPACITY(10)`
    - Sony `FC/03` firmware-info read
-   - Sony `FC/05` GetDeviceId read (`ClassifyType=3`の純正経路)
-   - Sony `FC/09` GetProductInfo形状のread-only probe (`Signature=roga`)
+   - Sony `FC/09` GetProductInfo形状のhistorical read-only probe (`Signature=roga`)
+   - 正規 `FC/05+roga` GetDeviceIdはordinary Diagnosticsでは送信せず、Recovery Stage 2Dのfresh preflight + explicit confirmation後だけ1回送信
 2. **Windows環境をログ化**
    - OS version / build
    - native architecture
@@ -117,8 +120,8 @@ Windows 7でも起動できる32-bitネイティブWin32 GUIです。64-bit Wind
 5. **状態メタデータをバイナリ保存**
    - SCSI INQUIRY
    - FC/03 FW info
-   - FC/05 DeviceId
    - FC/09 ProductInfo probe
+   - 正規FC/05+`roga`のraw 16 bytesはmetadataではなく専用PRIVATE blobへ保存
    - `NW-E405_metadata_YYYYMMDD_HHMMSS.bin`
    - これは**NOR/NANDのFWイメージではありません**。
 6. **メディアが正常にREAD CAPACITYを返す個体のみ、論理ストレージをREAD(10)で丸ごと保存**
@@ -304,12 +307,12 @@ chkdsk /f
 - [x] Windows NT系 scsipath0..25 読み取り診断 v0.3-dev
 - [x] 純正Updater互換パラメータ・scsipathマッピング診断 v0.3.1-dev
 - [x] v0.4-dev FC/04再送案を解析により撤回・Release/tag削除
-- [x] v0.5-dev 即時Flushログ / FW検証 / FC03・FC05・FC09 read-only preflight / metadata backup / READ(10) backup
+- [x] v0.5-dev 即時Flushログ / FW検証 / FC03・historical signature-less FC05・FC09 read-only preflight / metadata backup / READ(10) backup
 - [x] v0.5.1-dev MSVC例外処理まで含む純正Updater再監査 / 99%進捗ロジック固定テスト
 - [x] v0.6.1-dev No Media LBA0 direct READ(10) / FAT・MBR解析 / rescue image / MSFWUPGR.UPG抽出・公式SHA比較
 - [x] 故障実機からv0.3.1ログ収集（FC03成功 / 3A00確認）
 - [ ] SONYSPTI / scsipath経路への対応
-- [x] FC03 FW info / FC05 DeviceId経路の特定
+- [x] FC03 FW info / 正規E40X ClassifyType=3 FC05+`roga` GetDeviceId経路の特定とv0.8.3 Stage 2D化
 - [x] FC09 / ProductInfo read-only probeを純正GetProductInfo形状から実装
 - [x] UPGヘッダ / モデルID / セクション表 / E40X-E50X差分解析
 - [ ] UPG高エントロピーペイロードの暗号/圧縮/署名方式解析

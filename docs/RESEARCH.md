@@ -81,9 +81,9 @@ The large payload regions have very high entropy. They may be encrypted, compres
 
 ## Read-only Sony commands currently used
 
-- `FC/03`: firmware information, allocation length 8.
-- `FC/05`: GetDeviceId path for `ClassifyType=3`, allocation length 16.
-- `FC/09`: GetProductInfo-shaped data-in query using the INI signature `roga`, allocation length 24.
+- `FC/03`: firmware information, allocation length 8; ordinary Diagnostics uses this to establish the known Issue #1 firmware-info state.
+- `FC/09`: historical GetProductInfo-shaped data-in query using the INI signature `roga`, allocation length 24; ordinary Diagnostics still records it for continuity with earlier reports.
+- authentic E40X `FC/05+roga`: **not sent by ordinary Diagnostics**. v0.8.3 exposes it only as separately gated Recovery Stage 2D after fresh Issue #1 revalidation and explicit confirmation. Exact CDB is `FC 00 05 72 6F 67 61 00 00 10 00 00`, DATA IN 16.
 
 The current main branch does not contain `FC/04`, SCSI DATA OUT, or standard SCSI write opcodes.
 
@@ -342,3 +342,17 @@ Static control-flow evidence in `IcdMSCom.dll` now pins the important failure se
 Stage 2C therefore sends exactly `FC 00 01 53 4F 4E 59 49 43 44 00 74` once, DATA IN only, after its own explicit user confirmation and fresh Issue #1 state preflight. The transport now records the returned `SCSI_PASS_THROUGH_DIRECT.DataTransferLength`; application status is inspected only for SCSI GOOD plus an exact 116-byte transfer. A complete raw response is written only to a PRIVATE blob. The public report exposes the SCSI summary, one-byte Sony application status and response SHA-256, never the strings or decoded identifier fields.
 
 No `SONYICD Set 0x41..0x45`, `Reset 0x80`, format/erase, standard SCSI WRITE, or arbitrary DATA OUT path was added. The only explicit DATA OUT implementation remains the pre-existing fixed A3 select. The separately gated FC/04 recovery-resume path is unchanged.
+
+## v0.8.3 correction: authentic E40X ClassifyType=3 FC/05+roga (2026-09-26)
+
+The v0.8.2 ordinary diagnostic FC/05 was not the authentic E40X ClassifyType=3 command. It sent `FC 00 05 00 00 00 00 00 00 10 00 00`, omitting the INI `Signature=roga`. The failed-unit result for that historical shape was CHECK CONDITION `05/20/00` with returned DataTransferLength 0. That result means only **signature-less FC/05 failed**; it does not establish that authentic E40X FC/05 is unsupported.
+
+Static audit of official E40X `FWUpdater.exe`, `FWUpdaterCom.dll`, and INI pins the authentic path end-to-end. `Signature=roga` is copied into CDBREAD signature bytes 3..6; `ClassifyType=3` selects FC/05 and allocation length 16. The final transport CDB is exactly `FC 00 05 72 6F 67 61 00 00 10 00 00`, DATA IN 16 bytes.
+
+For ClassifyType 1..3, `FWUpdaterCom.dll` copies the 16-byte response directly to the TYPELIB-named `pbDeviceId` output without hex conversion, endian conversion, checksum, zero-content rejection, or semantic validation. The outer E40X updater obtains this value before and after update/re-enumeration and compares only the first 6 bytes for continuity when ClassifyType=3. This proves those first 6 bytes are identity-critical to that continuity check; it does **not** prove that the field is a serial number.
+
+Sony's original direct SPTI implementation requests 16 bytes but does not enforce the returned `DataTransferLength`. v0.8.3 is intentionally stricter: success requires IOCTL success, SCSI GOOD, returned DataTransferLength exactly 16, and 16 bytes copied. Zero length, short 1..15, over-length, CHECK CONDITION, non-GOOD status, and IOCTL failure are all rejected with no retry or follow-up vendor command.
+
+Stage 2D is isolated from ordinary Diagnostics. It performs its own fresh `INQUIRY + TUR + READ CAPACITY + FC/03` Issue #1 preflight. After that passes, a separate explicit confirmation shows the exact CDB and DATA-IN length before the one-shot send. Failure or decline terminates Stage 2D without DATA OUT, FC/04, or another vendor command.
+
+A complete 16-byte response is treated as PRIVATE device-specific `pbDeviceId` material regardless of content. All-zero and partially-zero values are transport-complete if the transport conditions pass, but no device-side semantic meaning is assigned. Raw 16 bytes and the first 6 continuity bytes are never written to PUBLIC_REPORT. A complete response is saved as `NW-E405_FC05_DEVICEID_PRIVATE_<session>.bin`; PUBLIC_REPORT exposes only probe/preflight state, IOCTL/Win32, SCSI/sense, requested/actual length, and SHA-256 after a complete successful response.

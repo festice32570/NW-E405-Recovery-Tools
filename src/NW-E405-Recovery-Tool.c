@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.8.2-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.8.3-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -41,7 +41,6 @@ static DWORD g_backupBlockSize = 0;
 static BOOL g_mediaBackupAvailable = FALSE;
 static BYTE g_metaInquiry[96]; static DWORD g_metaInquiryLen = 0;
 static BYTE g_metaFc03[8]; static DWORD g_metaFc03Len = 0;
-static BYTE g_metaFc05[16]; static DWORD g_metaFc05Len = 0;
 static BYTE g_metaFc09[24]; static DWORD g_metaFc09Len = 0;
 static LONG g_cdbSequence = 0;
 static WCHAR g_logPath[MAX_PATH] = {0};
@@ -70,6 +69,8 @@ typedef struct {
     BYTE senseKey;
     BYTE asc;
     BYTE ascq;
+    DWORD requestedDataLen;
+    DWORD actualDataLen;
     DWORD elapsedMs;
 } PublicScsiSummary;
 typedef struct {
@@ -85,16 +86,20 @@ static A3A4State g_a3a4State = A3A4_NOT_ATTEMPTED;
 static ProbeState g_stage2aPreflightState = PROBE_NOT_ATTEMPTED;
 static ProbeState g_stage2bPreflightState = PROBE_NOT_ATTEMPTED;
 static ProbeState g_stage2cPreflightState = PROBE_NOT_ATTEMPTED;
+static ProbeState g_stage2dPreflightState = PROBE_NOT_ATTEMPTED;
 static ProbeState g_sonyIcdTargetState = PROBE_NOT_ATTEMPTED;
+static ProbeState g_fc05DeviceIdState = PROBE_NOT_ATTEMPTED;
 static PublicScsiSummary g_pubLba0 = {0};
 static PublicScsiSummary g_pubFbPwStat = {0};
 static PublicScsiSummary g_pubFbDevInfo = {0};
 static PublicScsiSummary g_pubA3 = {0};
 static PublicScsiSummary g_pubA4 = {0};
 static PublicScsiSummary g_pubSonyIcdTarget = {0};
+static PublicScsiSummary g_pubFc05DeviceId = {0};
 static PublicPreflightSummary g_pubStage2aPreflight = {0};
 static PublicPreflightSummary g_pubStage2bPreflight = {0};
 static PublicPreflightSummary g_pubStage2cPreflight = {0};
+static PublicPreflightSummary g_pubStage2dPreflight = {0};
 static BOOL g_fbPwStatOk = FALSE;
 static BOOL g_fbDevInfoOk = FALSE;
 static WCHAR g_fbPwStatSha256[65] = {0};
@@ -103,6 +108,8 @@ static BOOL g_sonyIcdResponseRead = FALSE;
 static BOOL g_sonyIcdStatusValid = FALSE;
 static BYTE g_sonyIcdStatus = 0;
 static WCHAR g_sonyIcdTargetSha256[65] = {0};
+static BOOL g_fc05DeviceIdRead = FALSE;
+static WCHAR g_fc05DeviceIdSha256[65] = {0};
 static uint64_t g_rescueFreeBytes = 0;
 static BOOL g_rescueFreeKnown = FALSE;
 static WCHAR g_publicReportPath[MAX_PATH] = {0};
@@ -120,6 +127,7 @@ typedef struct {
     UCHAR scsiStatus;
     BYTE data[128];
     DWORD dataLen;
+    DWORD returnedDataLen;
     BYTE sense[32];
     BYTE cdb[16];
     BYTE cdbLen;
@@ -140,6 +148,8 @@ static void CapturePublicScsiSummary(PublicScsiSummary *dst, const ScsiResult *s
     dst->senseKey=(BYTE)(src->sense[2]&0x0F);
     dst->asc=src->sense[12];
     dst->ascq=src->sense[13];
+    dst->requestedDataLen=src->requestedDataLen;
+    dst->actualDataLen=src->returnedDataLen;
     dst->elapsedMs=src->elapsedMs;
 }
 
@@ -328,8 +338,9 @@ static ScsiResult SendCdbEx(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLe
     r.winErr = ok ? ERROR_SUCCESS : GetLastError();
     r.scsiStatus = pkt.sptd.ScsiStatus;
     CopyMemory(r.sense, pkt.sense, sizeof(r.sense));
+    r.returnedDataLen = (ok && dataLen) ? pkt.sptd.DataTransferLength : 0;
     if (data && dataLen && ok) {
-        DWORD actualLen = pkt.sptd.DataTransferLength;
+        DWORD actualLen = r.returnedDataLen;
         if (actualLen > dataLen) actualLen = dataLen;
         CopyMemory(r.data, data, actualLen);
         r.dataLen = actualLen;
@@ -345,6 +356,7 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
 
 
 static void ShowScsiResult(const WCHAR *name, const ScsiResult *r);
+static void ShowScsiResultRedacted(const WCHAR *name, const ScsiResult *r);
 static BOOL RevalidateIssue1State(HANDLE h, const WCHAR *label, PublicPreflightSummary *pub);
 
 static ScsiResult SendFixedA3SelectDeviceId(HANDLE h) {
@@ -362,6 +374,7 @@ static ScsiResult SendFixedA3SelectDeviceId(HANDLE h) {
     DWORD ret=0,started=GetTickCount();
     BOOL ok=DeviceIoControl(h,IOCTL_SCSI_PASS_THROUGH_DIRECT,&pkt,sizeof(pkt),&pkt,sizeof(pkt),&ret,NULL);
     r.elapsedMs=GetTickCount()-started; r.ioctlOk=ok; r.winErr=ok?ERROR_SUCCESS:GetLastError(); r.scsiStatus=pkt.sptd.ScsiStatus;
+    r.returnedDataLen=ok?pkt.sptd.DataTransferLength:0;
     CopyMemory(r.sense,pkt.sense,18); TraceCdbJson(&r); return r;
 }
 
@@ -475,7 +488,7 @@ static void ProbeSonyIcdTargetIdentifier(void) {
     BYTE cdb[12]={0xFC,0,0x01,'S','O','N','Y','I','C','D',0x00,0x74};
     ScsiResult rd=SendCdb(h,cdb,12,0x74);CapturePublicScsiSummary(&g_pubSonyIcdTarget,&rd);CloseHandle(h);
     ShowScsiResult(L"SONYICD 0x01 GetTargetIdentifier (E405-native read-only probe)",&rd);
-    if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.dataLen!=0x74){
+    if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.returnedDataLen!=0x74 || rd.dataLen!=0x74){
         LogF(L"SONYICD 0x01 did not return a complete 0x74-byte SCSI-GOOD response; no response fields are interpreted and no retry/write action follows.");return;
     }
     g_sonyIcdResponseRead=TRUE;g_sonyIcdStatusValid=TRUE;g_sonyIcdStatus=rd.data[0x0F];
@@ -487,6 +500,63 @@ static void ProbeSonyIcdTargetIdentifier(void) {
     }else{
         LogF(L"SONYICD application status is nonzero; Sony's original code returns this status without parsing identifier fields.");
     }
+}
+
+static void ProbeE40xFc05DeviceId(void) {
+    g_fc05DeviceIdState=PROBE_NOT_ATTEMPTED;g_stage2dPreflightState=PROBE_NOT_ATTEMPTED;
+    g_fc05DeviceIdRead=FALSE;g_fc05DeviceIdSha256[0]=0;
+    ZeroMemory(&g_pubFc05DeviceId,sizeof(g_pubFc05DeviceId));ZeroMemory(&g_pubStage2dPreflight,sizeof(g_pubStage2dPreflight));
+    if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
+        LogF(L"E40X FC/05+roga probe locked: Issue #1 state is not currently established.");return;
+    }
+    g_stage2dPreflightState=PROBE_FAILED;
+    HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL);
+    if(h==INVALID_HANDLE_VALUE){LogF(L"E40X FC/05+roga: device open failed %lu",GetLastError());return;}
+    if(!RevalidateIssue1State(h,L"Stage 2D live preflight",&g_pubStage2dPreflight)){
+        LogF(L"Stage 2D aborted: live Issue #1 state no longer matches. Authentic FC/05 was NOT sent.");
+        CloseHandle(h);return;
+    }
+    g_stage2dPreflightState=PROBE_SUCCESS;
+    if(MessageBoxW(g_hwnd,
+        L"Fresh Issue #1 preflight passed.\n\n"
+        L"Send the authentic Sony E40X ClassifyType=3 GetDeviceId query exactly once?\n\n"
+        L"CDB: FC 00 05 72 6F 67 61 00 00 10 00 00\n"
+        L"Direction: DATA IN only\n"
+        L"Requested response: 16 bytes\n\n"
+        L"The 16 bytes are treated only as private pbDeviceId data. They are NOT labeled as a serial number. "
+        L"Sony's E40X updater compares only the first 6 bytes for pre/post-update continuity.\n\n"
+        L"No retry, DATA OUT, FC/04, or follow-up vendor command will be sent by this probe.",
+        L"Recovery Stage 2D - authentic E40X FC/05+roga",
+        MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES){
+        g_fc05DeviceIdState=PROBE_DECLINED;
+        LogF(L"Stage 2D authentic FC/05+roga declined after successful live preflight; command NOT sent.");
+        CloseHandle(h);return;
+    }
+
+    g_fc05DeviceIdState=PROBE_FAILED;
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2D: authentic E40X ClassifyType=3 FC/05+roga ===");
+    LogF(L"Sending exactly one read-only CDB: FC 00 05 72 6F 67 61 00 00 10 00 00");
+    LogF(L"DATA IN 16 bytes only. Raw pbDeviceId bytes remain PRIVATE; no serial-number interpretation is performed.");
+    static const BYTE cdb[12]={0xFC,0x00,0x05,0x72,0x6F,0x67,0x61,0x00,0x00,0x10,0x00,0x00};
+    ScsiResult rd=SendCdb(h,cdb,12,16);
+    CapturePublicScsiSummary(&g_pubFc05DeviceId,&rd);
+    CloseHandle(h);
+    ShowScsiResultRedacted(L"SONY E40X FC/05+roga GetDeviceId (one-shot DATA IN)",&rd);
+
+    if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.returnedDataLen!=16 || rd.dataLen!=16){
+        LogF(L"E40X FC/05+roga did not return an exact 16-byte SCSI-GOOD response.");
+        LogF(L"Safety: short, zero-length, over-length, CHECK CONDITION, non-GOOD, or IOCTL-failed responses are rejected. No retry or follow-up vendor command will be sent.");
+        return;
+    }
+    if(!SavePrivateBlob(L"FC05_DEVICEID",rd.data,16,g_fc05DeviceIdSha256)){
+        g_fc05DeviceIdSha256[0]=0;
+        LogF(L"E40X FC/05+roga transport completed, but PRIVATE evidence save failed; probe is not promoted to SUCCESS.");
+        return;
+    }
+    g_fc05DeviceIdRead=TRUE;
+    g_fc05DeviceIdState=PROBE_SUCCESS;
+    LogF(L"E40X FC/05+roga complete 16-byte SCSI-GOOD response received; response SHA-256=%s",g_fc05DeviceIdSha256);
+    LogF(L"Raw 16-byte pbDeviceId content and its first 6 continuity bytes remain PRIVATE. All-zero or partially-zero content is not assigned any device-side semantic meaning.");
 }
 
 static void TraceCdbIntentJson(const ScsiResult *r) {
@@ -515,9 +585,9 @@ static void TraceCdbJson(const ScsiResult *r) {
     WideCharToMultiByte(CP_UTF8,0,senseHex,-1,senseA,sizeof(senseA),NULL,NULL);
     WideCharToMultiByte(CP_UTF8,0,dataHex,-1,dataA,sizeof(dataA),NULL,NULL);
     int n=_snprintf(line,sizeof(line)-1,
-        "{\"seq\":%ld,\"phase\":\"result\",\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu,\"ioctl_ok\":%s,\"win32\":%lu,\"scsi_status\":%u,\"sense\":\"%s\",\"data\":\"%s\",\"elapsed_ms\":%lu}\r\n",
+        "{\"seq\":%ld,\"phase\":\"result\",\"time\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03u\",\"target\":%u,\"cdb\":\"%s\",\"direction\":\"%s\",\"requested_data\":%lu,\"actual_data\":%lu,\"ioctl_ok\":%s,\"win32\":%lu,\"scsi_status\":%u,\"sense\":\"%s\",\"data\":\"%s\",\"elapsed_ms\":%lu}\r\n",
         r->traceSeq,st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond,st.wMilliseconds,
-        r->targetId,cdbA,r->direction==2?"OUT":(r->direction==1?"IN":"NONE"),r->requestedDataLen,r->ioctlOk?"true":"false",r->winErr,r->scsiStatus,senseA,dataA,r->elapsedMs);
+        r->targetId,cdbA,r->direction==2?"OUT":(r->direction==1?"IN":"NONE"),r->requestedDataLen,r->returnedDataLen,r->ioctlOk?"true":"false",r->winErr,r->scsiStatus,senseA,dataA,r->elapsedMs);
     if (n>0) { DWORD wr=0; WriteFile(g_jsonLog,line,(DWORD)n,&wr,NULL); FlushFileBuffers(g_jsonLog); }
 }
 
@@ -526,7 +596,7 @@ static void ShowScsiResult(const WCHAR *name, const ScsiResult *r) {
     BytesToHex(r->sense, 18, hex, 512);
     LogF(L"--- %s ---", name);
     WCHAR cdbhex[96]; BytesToHex(r->cdb, r->cdbLen, cdbhex, 96);
-    LogF(L"CDB: %s  TargetId=%u  DataLen=%lu  Elapsed=%lu ms", cdbhex, r->targetId, r->requestedDataLen, r->elapsedMs);
+    LogF(L"CDB: %s  TargetId=%u  Requested=%lu  Actual=%lu  Elapsed=%lu ms", cdbhex, r->targetId, r->requestedDataLen, r->returnedDataLen, r->elapsedMs);
     LogF(L"IOCTL=%s  SCSI Status=0x%02X  Win32=%lu",
         r->ioctlOk ? L"OK" : L"FAIL", r->scsiStatus, r->winErr);
     LogF(L"Sense: %s  ASC/ASCQ=%02X/%02X",
@@ -536,6 +606,21 @@ static void ShowScsiResult(const WCHAR *name, const ScsiResult *r) {
         BytesToHex(r->data, r->dataLen > 64 ? 64 : r->dataLen, hex, 512);
         LogF(L"Data: %s", hex);
     }
+    LogF(L"");
+}
+
+static void ShowScsiResultRedacted(const WCHAR *name, const ScsiResult *r) {
+    WCHAR hex[512];
+    BytesToHex(r->sense, 18, hex, 512);
+    LogF(L"--- %s ---", name);
+    WCHAR cdbhex[96]; BytesToHex(r->cdb, r->cdbLen, cdbhex, 96);
+    LogF(L"CDB: %s  TargetId=%u  Requested=%lu  Actual=%lu  Elapsed=%lu ms", cdbhex, r->targetId, r->requestedDataLen, r->returnedDataLen, r->elapsedMs);
+    LogF(L"IOCTL=%s  SCSI Status=0x%02X  Win32=%lu",
+        r->ioctlOk ? L"OK" : L"FAIL", r->scsiStatus, r->winErr);
+    LogF(L"Sense: %s  ASC/ASCQ=%02X/%02X",
+        SenseName(r->sense[2]), r->sense[12], r->sense[13]);
+    LogF(L"SenseHex: %s", hex);
+    if(r->dataLen) LogF(L"Data: [PRIVATE/REDACTED] %lu byte(s) copied; raw content is not displayed.",r->dataLen);
     LogF(L"");
 }
 
@@ -965,16 +1050,6 @@ static BOOL ProbeDiskInterface(const WCHAR *path, const WCHAR *friendly, int ind
             LogF(L"RESULT: Sony vendor read command did not complete successfully.");
         }
 
-        // Original GetDeviceId path for ClassifyType=3: FC/05, allocation 16.
-        ZeroMemory(cdb, sizeof(cdb));
-        cdb[0] = 0xFC; cdb[2] = 0x05; cdb[9] = 0x10;
-        ScsiResult devId = SendCdb(h, cdb, 12, 16);
-        ShowScsiResult(L"SONY 0xFC/0x05 GetDeviceId (read-only)", &devId);
-        if (devId.ioctlOk && devId.scsiStatus == 0) {
-            g_metaFc05Len = devId.dataLen > 16 ? 16 : devId.dataLen;
-            CopyMemory(g_metaFc05, devId.data, g_metaFc05Len);
-        }
-
         // Original GetProductInfo vendor-read shape. The INI signature is ASCII "roga".
         ZeroMemory(cdb, sizeof(cdb));
         cdb[0] = 0xFC; cdb[2] = 0x09;
@@ -1054,7 +1129,6 @@ static void SaveMetadataBackup(void) {
     DWORD wr=0; const char magic[]="NWE405META1"; WriteFile(h,magic,sizeof(magic),&wr,NULL);
     WriteTlv(h,1,g_metaInquiry,g_metaInquiryLen);
     WriteTlv(h,3,g_metaFc03,g_metaFc03Len);
-    WriteTlv(h,5,g_metaFc05,g_metaFc05Len);
     WriteTlv(h,9,g_metaFc09,g_metaFc09Len);
     FlushFileBuffers(h); CloseHandle(h);
     LogF(L"Metadata backup saved: %s",path);
@@ -1353,8 +1427,8 @@ static void WritePublicPreflightSummary(HANDLE h, const WCHAR *label, ProbeState
 static void WritePublicScsiSummary(HANDLE h, const WCHAR *label, const PublicScsiSummary *x) {
     WCHAR b[512];
     if(!x || !x->attempted){_snwprintf(b,511,L"%s: NOT ATTEMPTED",label);WriteUtf8Line(h,b);return;}
-    _snwprintf(b,511,L"%s: IOCTL=%s Win32=%lu SCSI=0x%02X Sense=%02X/%02X/%02X Elapsed=%lu ms",
-        label,x->ioctlOk?L"OK":L"FAIL",x->winErr,x->scsiStatus,x->senseKey,x->asc,x->ascq,x->elapsedMs);
+    _snwprintf(b,511,L"%s: IOCTL=%s Win32=%lu SCSI=0x%02X Sense=%02X/%02X/%02X Requested=%lu Actual=%lu Elapsed=%lu ms",
+        label,x->ioctlOk?L"OK":L"FAIL",x->winErr,x->scsiStatus,x->senseKey,x->asc,x->ascq,x->requestedDataLen,x->actualDataLen,x->elapsedMs);
     WriteUtf8Line(h,b);
 }
 
@@ -1364,8 +1438,8 @@ static void SavePublicReport(void) {
     HANDLE h=CreateFileW(g_publicReportPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
     if(h==INVALID_HANDLE_VALUE)return;
     DWORD wr=0;BYTE bom[3]={0xEF,0xBB,0xBF};WriteFile(h,bom,3,&wr,NULL);
-    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8.2-dev - PUBLIC REPORT");
-    WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID/SONYICD response, image sectors, music data, or full vendor responses.");
+    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8.3-dev - PUBLIC REPORT");
+    WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw FC/05 pbDeviceId, DvID/SONYICD response, image sectors, music data, or full vendor responses.");
     WCHAR b[512];
     _snwprintf(b,511,L"Exact USB/SCSI identity: %s",g_exactDevicePath[0]?L"YES":L"NO");WriteUtf8Line(h,b);
     _snwprintf(b,511,L"TUR Medium Not Present 3A00: %s",g_issue1TurNoMedia?L"YES":L"NO");WriteUtf8Line(h,b);
@@ -1383,6 +1457,7 @@ static void SavePublicReport(void) {
     const WCHAR *diState=(g_fbDevInfoState==PROBE_SUCCESS)?L"SUCCESS":(g_fbDevInfoState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbDevInfoState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
     const WCHAR *a3State=(g_a3a4State==A3A4_SUCCESS)?L"SUCCESS":(g_a3a4State==A3A4_FAILED)?L"ATTEMPTED-FAILED":(g_a3a4State==A3A4_DECLINED)?L"DECLINED":(g_a3a4State==A3A4_BLOCKED_PREFLIGHT)?L"BLOCKED-PREFLIGHT":L"NOT ATTEMPTED";
     const WCHAR *icdState=(g_sonyIcdTargetState==PROBE_SUCCESS)?L"SUCCESS":(g_sonyIcdTargetState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_sonyIcdTargetState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
+    const WCHAR *fc05State=(g_fc05DeviceIdState==PROBE_SUCCESS)?L"SUCCESS":(g_fc05DeviceIdState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fc05DeviceIdState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
     WritePublicPreflightSummary(h,L"Stage 2A live state preflight",g_stage2aPreflightState,&g_pubStage2aPreflight);
     _snwprintf(b,511,L"FB/PW_STAT read-only compatibility probe: %s",pwState);WriteUtf8Line(h,b);
     WritePublicScsiSummary(h,L"FB/PW_STAT SCSI result",&g_pubFbPwStat);
@@ -1400,8 +1475,12 @@ static void SavePublicReport(void) {
     WritePublicScsiSummary(h,L"SONYICD 0x01 SCSI result",&g_pubSonyIcdTarget);
     if(g_sonyIcdStatusValid){_snwprintf(b,511,L"SONYICD 0x01 application status byte: 0x%02X",g_sonyIcdStatus);WriteUtf8Line(h,b);}
     if(g_sonyIcdResponseRead&&g_sonyIcdTargetSha256[0]){_snwprintf(b,511,L"SONYICD 0x01 response SHA-256 only: %s",g_sonyIcdTargetSha256);WriteUtf8Line(h,b);}
+    WritePublicPreflightSummary(h,L"Stage 2D live state preflight",g_stage2dPreflightState,&g_pubStage2dPreflight);
+    _snwprintf(b,511,L"Authentic E40X FC/05+roga GetDeviceId read-only probe: %s",fc05State);WriteUtf8Line(h,b);
+    WritePublicScsiSummary(h,L"E40X FC/05+roga SCSI result",&g_pubFc05DeviceId);
+    if(g_fc05DeviceIdRead&&g_fc05DeviceIdState==PROBE_SUCCESS&&g_fc05DeviceIdSha256[0]){_snwprintf(b,511,L"E40X FC/05+roga response SHA-256 only: %s",g_fc05DeviceIdSha256);WriteUtf8Line(h,b);}
     WriteUtf8Line(h,L"PUBLIC upload rule: attach only this NW-E405_PUBLIC_REPORT_*.txt to GitHub Issue #1.");
-    WriteUtf8Line(h,L"PRIVATE: TXT journal, JSONL trace, metadata.bin, DvID/FB/SONYICD blobs, LBA/IMG, recovered UPG. Do NOT attach these to the public issue.");
+    WriteUtf8Line(h,L"PRIVATE: TXT journal, JSONL trace, metadata.bin, FC05_DEVICEID/DvID/FB/SONYICD blobs, LBA/IMG, recovered UPG. Do NOT attach these to the public issue.");
     FlushFileBuffers(h);CloseHandle(h);
 }
 
@@ -1481,6 +1560,9 @@ static void RunRecoveryLadder(void) {
         SavePublicReport();
         int icdans=MessageBoxW(g_hwnd,L"次に、Sony MP3 File ManagerのNW-E405世代純正IcdMSCom.dll由来の読み取り専用SONYICD 0x01 GetTargetIdentifierを1回だけ試せます。\n\n固定CDBで116バイト(DATA IN)だけを要求し、本体へdata payloadは送りません。応答には個体情報が含まれる可能性があるため、生データはPRIVATE保存し、PUBLIC_REPORTにはSCSI結果・アプリstatus byte・SHA-256だけを記録します。\n\n試しますか？",L"Recovery Stage 2C - E405 SONYICD read probe",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
         if(icdans==IDYES)ProbeSonyIcdTargetIdentifier(); else {g_sonyIcdTargetState=PROBE_DECLINED;g_stage2cPreflightState=PROBE_NOT_ATTEMPTED;g_sonyIcdResponseRead=FALSE;g_sonyIcdStatusValid=FALSE;ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight));ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget));}
+        SavePublicReport();
+        int fc05ans=MessageBoxW(g_hwnd,L"次にSony純正E40X ClassifyType=3の正規GetDeviceId経路を独立して確認できます。\n\n正規CDBは FC 00 05 72 6F 67 61 00 00 10 00 00、DATA IN 16 bytesです。\n送信前にIssue #1状態をfresh preflightで再確認し、通過後にも最終送信確認を表示します。\n\nraw 16 bytesはPRIVATE扱いで、serial numberとは決めつけません。PUBLIC_REPORTにはSCSI結果・要求/実転送長・完全成功時のSHA-256だけを記録します。\n\nStage 2Dのpreflightへ進みますか？",L"Recovery Stage 2D - authentic E40X FC/05+roga",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
+        if(fc05ans==IDYES)ProbeE40xFc05DeviceId(); else {g_fc05DeviceIdState=PROBE_DECLINED;g_stage2dPreflightState=PROBE_NOT_ATTEMPTED;g_fc05DeviceIdRead=FALSE;g_fc05DeviceIdSha256[0]=0;ZeroMemory(&g_pubStage2dPreflight,sizeof(g_pubStage2dPreflight));ZeroMemory(&g_pubFc05DeviceId,sizeof(g_pubFc05DeviceId));}
         SavePublicReport();return;
     }
     LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();
@@ -1524,14 +1606,14 @@ static void RunDiagnostics(void) {
     SetWindowTextW(g_output, L"");
     g_mediaBackupAvailable=FALSE; g_backupDevicePath[0]=0; g_backupCapacityBytes=0; g_backupBlockSize=0;
     g_noMediaRescueAvailable=FALSE; g_exactDevicePath[0]=0;
-    g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
+    g_metaInquiryLen=g_metaFc03Len=g_metaFc09Len=0;
     g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
     g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0;
     g_fbPwStatOk=FALSE; g_fbDevInfoOk=FALSE; g_fbPwStatState=PROBE_NOT_ATTEMPTED; g_fbDevInfoState=PROBE_NOT_ATTEMPTED;
-    g_stage2aPreflightState=PROBE_NOT_ATTEMPTED; g_stage2bPreflightState=PROBE_NOT_ATTEMPTED; g_stage2cPreflightState=PROBE_NOT_ATTEMPTED; g_a3a4State=A3A4_NOT_ATTEMPTED; g_sonyIcdTargetState=PROBE_NOT_ATTEMPTED;
+    g_stage2aPreflightState=PROBE_NOT_ATTEMPTED; g_stage2bPreflightState=PROBE_NOT_ATTEMPTED; g_stage2cPreflightState=PROBE_NOT_ATTEMPTED; g_stage2dPreflightState=PROBE_NOT_ATTEMPTED; g_a3a4State=A3A4_NOT_ATTEMPTED; g_sonyIcdTargetState=PROBE_NOT_ATTEMPTED; g_fc05DeviceIdState=PROBE_NOT_ATTEMPTED;
     ZeroMemory(&g_pubLba0,sizeof(g_pubLba0)); ZeroMemory(&g_pubFbPwStat,sizeof(g_pubFbPwStat)); ZeroMemory(&g_pubFbDevInfo,sizeof(g_pubFbDevInfo));
-    ZeroMemory(&g_pubA3,sizeof(g_pubA3)); ZeroMemory(&g_pubA4,sizeof(g_pubA4)); ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget)); ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight)); ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight)); ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight));
-    g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_sonyIcdResponseRead=FALSE; g_sonyIcdStatusValid=FALSE; g_sonyIcdStatus=0; g_sonyIcdTargetSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
+    ZeroMemory(&g_pubA3,sizeof(g_pubA3)); ZeroMemory(&g_pubA4,sizeof(g_pubA4)); ZeroMemory(&g_pubSonyIcdTarget,sizeof(g_pubSonyIcdTarget)); ZeroMemory(&g_pubFc05DeviceId,sizeof(g_pubFc05DeviceId)); ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight)); ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight)); ZeroMemory(&g_pubStage2cPreflight,sizeof(g_pubStage2cPreflight)); ZeroMemory(&g_pubStage2dPreflight,sizeof(g_pubStage2dPreflight));
+    g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_sonyIcdResponseRead=FALSE; g_sonyIcdStatusValid=FALSE; g_sonyIcdStatus=0; g_sonyIcdTargetSha256[0]=0; g_fc05DeviceIdRead=FALSE; g_fc05DeviceIdSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");
@@ -1546,7 +1628,7 @@ static void RunDiagnostics(void) {
     LogHostEnvironment();
     LogF(L"");
     LogF(L"診断ボタン自体はフォーマット、セクタ書込み、FW書込み、FC/04更新開始を実行しません。");
-    LogF(L"FC/03, FC/05, FC/09 are Sony read/query commands reconstructed from the original updater DLL.");
+    LogF(L"Ordinary Diagnostics sends FC/03 and the historical FC/09+roga read query only; authentic FC/05+roga is isolated behind Recovery Stage 2D preflight and explicit confirmation.");
     LogF(L"");
 
     BOOL usb = ScanSonyUsbDevices();

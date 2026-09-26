@@ -58,7 +58,7 @@ def test_public_issue_instruction_never_requests_private_logs():
 def test_sonyicd_target_exact_read_only_cdb():
     assert "BYTE cdb[12]={0xFC,0,0x01,'S','O','N','Y','I','C','D',0x00,0x74};" in SRC
     assert "SendCdb(h,cdb,12,0x74)" in SRC
-    assert "rd.dataLen!=0x74" in SRC
+    assert "rd.returnedDataLen!=0x74 || rd.dataLen!=0x74" in SRC
 
 def test_sonyicd_target_is_separately_gated_and_revalidated():
     assert "Recovery Stage 2C - E405 SONYICD read probe" in SRC
@@ -76,5 +76,6 @@ def test_sonyicd_set_and_reset_commands_are_not_live_probes():
         assert f"{{0xFC,0,{cmd},'S','O','N','Y','I','C','D'" not in SRC
 
 def test_data_in_result_uses_actual_sptd_transfer_length():
-    assert "DWORD actualLen = pkt.sptd.DataTransferLength;" in SRC
+    assert "r.returnedDataLen = (ok && dataLen) ? pkt.sptd.DataTransferLength : 0;" in SRC
+    assert "DWORD actualLen = r.returnedDataLen;" in SRC
     assert "r.dataLen = actualLen;" in SRC
