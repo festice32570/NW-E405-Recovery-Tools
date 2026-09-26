@@ -160,3 +160,19 @@ The three PBR files are 512-byte FAT16 boot-sector templates with `55 AA` signat
 The E40X updater has no `PBR`, `StorageMediaFormatType`, `CheckStorageFormatType`, `SendFWUpdateCommandExt`, `DeleteUpdateFileExt`, `GetDeviceIdExt`, or `FWPackageWritePathName` strings. The extended mechanism appears to have been added in the A600-generation updater rather than being exposed in the E405 updater.
 
 Reproducible checks are in `tools/a600_ext_audit.py`; the Sony binaries themselves are not committed.
+
+## Issue #1 v0.7 public report result (2026-09-26)
+
+The returned `NW-E405_PUBLIC_REPORT_20260926_040236.txt` established the next boundary on the actual failed unit:
+
+- exact USB/SCSI identity matched;
+- TUR remained `3A00 Medium Not Present`;
+- READ CAPACITY remained `3A00 Medium Not Present`;
+- the known FC/03 1.x response still matched;
+- the bounded direct `READ(10)` of LBA0 was also unreadable.
+
+This closes the ordinary logical-media rescue branch for the current device state: FAT/MBR/PBR traversal, logical imaging, root `MSFWUPGR.UPG` recovery, and any free-space estimate cannot be performed through the normal SCSI logical-media path while LBA0 remains unreadable.
+
+Two v0.7 public-report fields were semantically ambiguous and must not be over-interpreted. `Root MSFWUPGR.UPG exact official match: NO` did not mean a compared package mismatched; the package was never reachable because LBA0 could not be read. `A3/A4 Device-ID query: NOT ACQUIRED` did not distinguish user decline, no attempt, A3 failure, or A4 failure.
+
+v0.8.1-dev addresses this evidence gap without requiring private logs to be posted publicly. The PUBLIC_REPORT records safe command-result summaries (`IOCTL`, Win32 status, SCSI status and Sense Key/ASC/ASCQ), distinguishes A3 and A4, records Stage 2A/2B live-state preflight components, and uses explicit NOT CHECKED / NOT EVALUABLE wording when logical media is unreadable. Raw responses and private evidence remain excluded from the public report.

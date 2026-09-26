@@ -13,7 +13,7 @@
 #include <wincrypt.h>
 #include "fw_package.h"
 
-#define APP_TITLE L"NW-E405 Recovery Tool v0.8-dev"
+#define APP_TITLE L"NW-E405 Recovery Tool v0.8.1-dev"
 #define SONY_VIDPID L"VID_054C&PID_01FB"
 #define ID_SCAN 1001
 #define ID_COPY 1002
@@ -61,10 +61,36 @@ static BOOL g_vendorDvIdRead = FALSE;
 static BYTE g_vendorDvId[16] = {0};
 static WCHAR g_vendorDvIdSha256[65] = {0};
 typedef enum { PROBE_NOT_ATTEMPTED=0, PROBE_DECLINED=1, PROBE_FAILED=2, PROBE_SUCCESS=3 } ProbeState;
-typedef enum { A3A4_NOT_ATTEMPTED=0, A3A4_DECLINED=1, A3A4_FAILED=2, A3A4_SUCCESS=3 } A3A4State;
+typedef enum { A3A4_NOT_ATTEMPTED=0, A3A4_DECLINED=1, A3A4_FAILED=2, A3A4_SUCCESS=3, A3A4_BLOCKED_PREFLIGHT=4 } A3A4State;
+typedef struct {
+    BOOL attempted;
+    BOOL ioctlOk;
+    DWORD winErr;
+    UCHAR scsiStatus;
+    BYTE senseKey;
+    BYTE asc;
+    BYTE ascq;
+    DWORD elapsedMs;
+} PublicScsiSummary;
+typedef struct {
+    BOOL attempted;
+    BOOL identityOk;
+    BOOL tur3a00;
+    BOOL cap3a00;
+    BOOL fc03Known;
+} PublicPreflightSummary;
 static ProbeState g_fbPwStatState = PROBE_NOT_ATTEMPTED;
 static ProbeState g_fbDevInfoState = PROBE_NOT_ATTEMPTED;
 static A3A4State g_a3a4State = A3A4_NOT_ATTEMPTED;
+static ProbeState g_stage2aPreflightState = PROBE_NOT_ATTEMPTED;
+static ProbeState g_stage2bPreflightState = PROBE_NOT_ATTEMPTED;
+static PublicScsiSummary g_pubLba0 = {0};
+static PublicScsiSummary g_pubFbPwStat = {0};
+static PublicScsiSummary g_pubFbDevInfo = {0};
+static PublicScsiSummary g_pubA3 = {0};
+static PublicScsiSummary g_pubA4 = {0};
+static PublicPreflightSummary g_pubStage2aPreflight = {0};
+static PublicPreflightSummary g_pubStage2bPreflight = {0};
 static BOOL g_fbPwStatOk = FALSE;
 static BOOL g_fbDevInfoOk = FALSE;
 static WCHAR g_fbPwStatSha256[65] = {0};
@@ -95,6 +121,19 @@ typedef struct {
     LONG traceSeq;
     int direction; /* 0=none, 1=in, 2=out */
 } ScsiResult;
+
+static void CapturePublicScsiSummary(PublicScsiSummary *dst, const ScsiResult *src) {
+    if(!dst || !src) return;
+    ZeroMemory(dst,sizeof(*dst));
+    dst->attempted=TRUE;
+    dst->ioctlOk=src->ioctlOk;
+    dst->winErr=src->winErr;
+    dst->scsiStatus=src->scsiStatus;
+    dst->senseKey=(BYTE)(src->sense[2]&0x0F);
+    dst->asc=src->sense[12];
+    dst->ascq=src->sense[13];
+    dst->elapsedMs=src->elapsedMs;
+}
 
 typedef struct {
     BOOL valid;
@@ -296,6 +335,7 @@ static ScsiResult SendCdb(HANDLE h, const BYTE *cdb, BYTE cdbLen, DWORD dataLen)
 
 
 static void ShowScsiResult(const WCHAR *name, const ScsiResult *r);
+static BOOL RevalidateIssue1State(HANDLE h, const WCHAR *label, PublicPreflightSummary *pub);
 
 static ScsiResult SendFixedA3SelectDeviceId(HANDLE h) {
     ScsiResult r; ZeroMemory(&r,sizeof(r)); r.opened=TRUE;
@@ -341,18 +381,24 @@ static BOOL SavePrivateBlob(const WCHAR *tag, const BYTE *data, DWORD len, WCHAR
 }
 
 static void ProbeA600ReadOnlyVendorInfo(void) {
-    g_fbPwStatOk=FALSE;g_fbDevInfoOk=FALSE;g_fbPwStatState=PROBE_NOT_ATTEMPTED;g_fbDevInfoState=PROBE_NOT_ATTEMPTED;g_fbPwStatSha256[0]=0;g_fbDevInfoSha256[0]=0;
+    g_fbPwStatOk=FALSE;g_fbDevInfoOk=FALSE;g_fbPwStatState=PROBE_NOT_ATTEMPTED;g_fbDevInfoState=PROBE_NOT_ATTEMPTED;g_stage2aPreflightState=PROBE_NOT_ATTEMPTED;
+    ZeroMemory(&g_pubFbPwStat,sizeof(g_pubFbPwStat));ZeroMemory(&g_pubFbDevInfo,sizeof(g_pubFbDevInfo));ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight));
+    g_fbPwStatSha256[0]=0;g_fbDevInfoSha256[0]=0;
     if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
         LogF(L"FB vendor read probe locked: Issue #1 state is not currently established.");return;
     }
+    g_stage2aPreflightState=PROBE_FAILED;
     HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL);
     if(h==INVALID_HANDLE_VALUE){LogF(L"FB vendor read probe: device open failed %lu",GetLastError());return;}
+    if(!RevalidateIssue1State(h,L"Stage 2A live preflight",&g_pubStage2aPreflight)){LogF(L"Stage 2A aborted: live Issue #1 state no longer matches.");CloseHandle(h);return;}
+    g_stage2aPreflightState=PROBE_SUCCESS;
     LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2A: same-generation Sony read-only vendor probes ===");
     LogF(L"Experimental compatibility probe only: commands are proven from Sony NW-A600 FWUpdaterCom.dll, not from the NW-E405 updater.");
     LogF(L"Both commands are DATA IN only. No payload is sent to the player.");
     BYTE pwCdb[12]={0xFB,0,0,'P','W','_','S','T','A','T',0x20,0};
     g_fbPwStatState=PROBE_FAILED;
     ScsiResult pw=SendCdb(h,pwCdb,12,32);
+    CapturePublicScsiSummary(&g_pubFbPwStat,&pw);
     ShowScsiResult(L"SONY FB/PW_STAT (A600 read-only compatibility probe)",&pw);
     if(pw.ioctlOk&&pw.scsiStatus==0&&pw.dataLen>=32){
         g_fbPwStatOk=TRUE;g_fbPwStatState=PROBE_SUCCESS;SavePrivateBlob(L"FB_PWSTAT",pw.data,32,g_fbPwStatSha256);
@@ -360,6 +406,7 @@ static void ProbeA600ReadOnlyVendorInfo(void) {
     BYTE diCdb[12]={0xFB,0,0,'D','E','V','I','N','F','O',0x80,0};
     g_fbDevInfoState=PROBE_FAILED;
     ScsiResult di=SendCdb(h,diCdb,12,128);
+    CapturePublicScsiSummary(&g_pubFbDevInfo,&di);
     ShowScsiResult(L"SONY FB/DEVINFO (A600 read-only compatibility probe)",&di);
     if(di.ioctlOk&&di.scsiStatus==0&&di.dataLen>=128){
         g_fbDevInfoOk=TRUE;g_fbDevInfoState=PROBE_SUCCESS;SavePrivateBlob(L"FB_DEVINFO",di.data,128,g_fbDevInfoSha256);
@@ -369,19 +416,24 @@ static void ProbeA600ReadOnlyVendorInfo(void) {
 }
 
 static BOOL QueryVendorDvId(void) {
-    g_a3a4State=A3A4_FAILED;
+    g_a3a4State=A3A4_BLOCKED_PREFLIGHT;g_stage2bPreflightState=PROBE_NOT_ATTEMPTED;
+    ZeroMemory(&g_pubA3,sizeof(g_pubA3));ZeroMemory(&g_pubA4,sizeof(g_pubA4));ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight));
     if(!g_exactDevicePath[0] || !(g_issue1TurNoMedia&&g_issue1CapNoMedia&&g_issue1FwInfoMatch)){
         LogF(L"A3/A4 vendor query locked: Issue #1 state is not currently established."); return FALSE;
     }
+    g_stage2bPreflightState=PROBE_FAILED;
     HANDLE h=OpenDeviceRW(g_exactDevicePath,NULL); if(h==INVALID_HANDLE_VALUE){LogF(L"A3/A4: device open failed %lu",GetLastError());return FALSE;}
-    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2: Sony MP3FM A3/A4 Device-ID query ===");
+    if(!RevalidateIssue1State(h,L"Stage 2B live preflight",&g_pubStage2bPreflight)){LogF(L"Stage 2B aborted: live Issue #1 state no longer matches.");CloseHandle(h);return FALSE;}
+    g_stage2bPreflightState=PROBE_SUCCESS;g_a3a4State=A3A4_FAILED;
+    LogF(L"");LogF(L"=== RECOVERY LADDER STAGE 2B: Sony MP3FM A3/A4 Device-ID query ===");
     LogF(L"A3/A4 sequence is fixed to the NW-E405 capture: A3 selects the 18-byte record; A4 reads it.");
     LogF(L"A3 is the only DATA OUT command in this build; payload is fixed to 00 12 followed by zeros.");
     ScsiResult sel=SendFixedA3SelectDeviceId(h);
+    CapturePublicScsiSummary(&g_pubA3,&sel);
     LogF(L"A3 select: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X",sel.ioctlOk?L"OK":L"FAIL",sel.scsiStatus,sel.sense[12],sel.sense[13]);
     if(!sel.ioctlOk || sel.scsiStatus!=0){CloseHandle(h);LogF(L"A3 select failed; A4 was NOT sent.");return FALSE;}
     BYTE cdb[12]={0xA4,0,0,0,0,0,0,0xBC,0,0x12,0x3F,0};
-    ScsiResult rd=SendCdb(h,cdb,12,18); CloseHandle(h);
+    ScsiResult rd=SendCdb(h,cdb,12,18); CapturePublicScsiSummary(&g_pubA4,&rd); CloseHandle(h);
     LogF(L"A4 read: IOCTL=%s SCSI=0x%02X Sense=%02X/%02X DataLen=%lu",rd.ioctlOk?L"OK":L"FAIL",rd.scsiStatus,rd.sense[12],rd.sense[13],rd.dataLen);
     if(!rd.ioctlOk || rd.scsiStatus!=0 || rd.dataLen<18 || rd.data[0]!=0x00 || rd.data[1]!=0x10){LogF(L"A4 response did not match the expected 00 10 + 16-byte record shape.");return FALSE;}
     BOOL nz=FALSE;for(int i=2;i<18;i++)if(rd.data[i])nz=TRUE;if(!nz){LogF(L"A4 returned an all-zero Device-ID record.");return FALSE;}
@@ -1180,7 +1232,7 @@ static void RescueNoMedia(void) {
     if(!g_noMediaRescueAvailable || !g_exactDevicePath[0]){MessageBoxW(g_hwnd,L"先に診断を実行し、Issue #1のNo Media状態を確認してください。",L"Rescue locked",MB_OK|MB_ICONWARNING);return;}
     int ans=MessageBoxW(g_hwnd,L"No Media状態でもLBA0をREAD(10)で512バイトだけ直接読みます。\n\n本体への書き込みコマンドは一切送信しません。\nLBA0が読めた場合だけFAT/MBRを解析し、続けてイメージ救出を提案します。\n\n開始しますか？",L"No Media read-only rescue",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);if(ans!=IDYES)return;
     HANDLE dev=OpenDeviceRW(g_exactDevicePath,NULL);if(dev==INVALID_HANDLE_VALUE){LogF(L"No Media rescue: device open failed %lu",GetLastError());return;}
-    BYTE sec0[512];ZeroMemory(sec0,sizeof(sec0));ScsiResult tr;BOOL ok=Read10Chunk(dev,0,1,sec0,512,&tr);TraceCdbJson(&tr);
+    BYTE sec0[512];ZeroMemory(sec0,sizeof(sec0));ScsiResult tr;BOOL ok=Read10Chunk(dev,0,1,sec0,512,&tr);CapturePublicScsiSummary(&g_pubLba0,&tr);TraceCdbJson(&tr);
     LogF(L"");LogF(L"=== NO MEDIA DIRECT READ(10) RESCUE ===");ShowScsiResult(L"READ(10) LBA=0 blocks=1",&tr);
     if(!ok){g_lba0Unreadable=TRUE;LogF(L"LBA0 could not be read. The normal logical-NAND SCSI read path is unavailable in this state.");LogF(L"RECOVERY STATE: LOGICAL_MEDIA_UNREADABLE — next research path is Sony vendor access (A3/A4 and other read commands), then XBOOT/service ROM if needed.");CloseHandle(dev);SetStatus(L"No Media救出: LBA0も読み出せませんでした");return;}
     { WCHAR hx[512]={0}; BytesToHex(sec0,64,hx,512); LogF(L"LBA0 first 64 bytes: %s",hx); }
@@ -1206,7 +1258,7 @@ static void RescueNoMedia(void) {
         }else{LogF(L"UPG COMPARISON: DOES NOT MATCH verified Japanese v2.0 UPG.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH — do NOT start firmware update from this on-device package.");}}
     else {uint64_t off=0;if(ScanImageForUpg(imagePath,upgPath,hash,&off)){LogF(L"FAT root extraction failed, but raw UPGR_FMT candidate was found at image offset 0x%I64X",off);LogF(L"Raw candidate: %s",upgPath);LogF(L"Raw candidate SHA-256: %s",hash);if(!_wcsicmp(hash,L"82977775f1333892acfd4926739458cb4054a40d204e8b5d651539d77ace4691")){LogF(L"UPG COMPARISON: EXACT MATCH with verified Japanese v2.0 official UPG.");LogF(L"RECOVERY STATE: PACKAGE_INTACT_RAW — official package bytes are present even though FAT extraction failed.");}else{LogF(L"UPG COMPARISON: candidate header matches but SHA-256 differs from official v2.0.");LogF(L"RECOVERY STATE: PACKAGE_MISMATCH_RAW — do NOT use this candidate for update-start.");}}else{LogF(L"No MSFWUPGR.UPG root entry or raw UPGR_FMT candidate was found in the rescued image.");LogF(L"RECOVERY STATE: PACKAGE_NOT_FOUND — repair needs a verified way to restore the package or a lower-level flash transport.");}}
     SaveLog();SetStatus(L"No Media救出解析完了 — ログとIMG/UPG候補を確認してください");
-    MessageBoxW(g_hwnd,L"No Media救出解析が完了しました。\n\nログフォルダにIMGと、見つかった場合はMSFWUPGR.UPG候補を保存しました。\nTXT/JSONLと一緒にIssue #1へ添付してください。",L"Rescue analysis complete",MB_OK|MB_ICONINFORMATION);
+    MessageBoxW(g_hwnd,L"No Media救出解析が完了しました。\n\nログフォルダにIMGと、見つかった場合はMSFWUPGR.UPG候補を保存しました。\nGitHub Issue #1へ添付するのは NW-E405_PUBLIC_REPORT_*.txt だけにしてください。TXT/JSONL、IMG、UPG候補はPRIVATE扱いです。",L"Rescue analysis complete",MB_OK|MB_ICONINFORMATION);
 }
 
 static void BackupLogicalMedia(void) {
@@ -1241,13 +1293,36 @@ static void BackupLogicalMedia(void) {
     else {LogF(L"Partial image retained for analysis: %s",partial);SetStatus(L"バックアップ途中で停止 — partialを保持しました");}
 }
 
+static const WCHAR *ProbeStateLabel(ProbeState state) {
+    if(state==PROBE_SUCCESS)return L"PASS";
+    if(state==PROBE_FAILED)return L"FAIL";
+    if(state==PROBE_DECLINED)return L"DECLINED";
+    return L"NOT ATTEMPTED";
+}
+
+static void WritePublicPreflightSummary(HANDLE h, const WCHAR *label, ProbeState state, const PublicPreflightSummary *x) {
+    WCHAR b[512];
+    if(!x || !x->attempted){_snwprintf(b,511,L"%s: %s",label,ProbeStateLabel(state));WriteUtf8Line(h,b);return;}
+    _snwprintf(b,511,L"%s: %s identity=%s TUR3A00=%s CAP3A00=%s FC03-known=%s",label,ProbeStateLabel(state),
+        x->identityOk?L"YES":L"NO",x->tur3a00?L"YES":L"NO",x->cap3a00?L"YES":L"NO",x->fc03Known?L"YES":L"NO");
+    WriteUtf8Line(h,b);
+}
+
+static void WritePublicScsiSummary(HANDLE h, const WCHAR *label, const PublicScsiSummary *x) {
+    WCHAR b[512];
+    if(!x || !x->attempted){_snwprintf(b,511,L"%s: NOT ATTEMPTED",label);WriteUtf8Line(h,b);return;}
+    _snwprintf(b,511,L"%s: IOCTL=%s Win32=%lu SCSI=0x%02X Sense=%02X/%02X/%02X Elapsed=%lu ms",
+        label,x->ioctlOk?L"OK":L"FAIL",x->winErr,x->scsiStatus,x->senseKey,x->asc,x->ascq,x->elapsedMs);
+    WriteUtf8Line(h,b);
+}
+
 static void SavePublicReport(void) {
     if(!g_sessionStem[0])return;
     _snwprintf(g_publicReportPath,MAX_PATH-1,L"%s\\NW-E405_PUBLIC_REPORT_%s.txt",g_exeDir,g_sessionStem);
     HANDLE h=CreateFileW(g_publicReportPath,GENERIC_WRITE,FILE_SHARE_READ,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,NULL);
     if(h==INVALID_HANDLE_VALUE)return;
     DWORD wr=0;BYTE bom[3]={0xEF,0xBB,0xBF};WriteFile(h,bom,3,&wr,NULL);
-    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8-dev - PUBLIC REPORT");
+    WriteUtf8Line(h,L"NW-E405 Recovery Tool v0.8.1-dev - PUBLIC REPORT");
     WriteUtf8Line(h,L"Safe to attach to the public GitHub Issue: contains no raw DvID, image sectors, music data, or full vendor responses.");
     WCHAR b[512];
     _snwprintf(b,511,L"Exact USB/SCSI identity: %s",g_exactDevicePath[0]?L"YES":L"NO");WriteUtf8Line(h,b);
@@ -1255,6 +1330,8 @@ static void SavePublicReport(void) {
     _snwprintf(b,511,L"READ CAPACITY Medium Not Present 3A00: %s",g_issue1CapNoMedia?L"YES":L"NO");WriteUtf8Line(h,b);
     _snwprintf(b,511,L"Known FC/03 1.x response: %s",g_issue1FwInfoMatch?L"YES":L"NO");WriteUtf8Line(h,b);
     _snwprintf(b,511,L"LBA0 unreadable: %s",g_lba0Unreadable?L"YES":L"NO");WriteUtf8Line(h,b);
+    WritePublicScsiSummary(h,L"LBA0 READ(10) result",&g_pubLba0);
+    if(g_lba0Unreadable) WriteUtf8Line(h,L"Recovery branch: LOGICAL_MEDIA_UNREADABLE");
     if(g_lba0Unreadable) WriteUtf8Line(h,L"Root MSFWUPGR.UPG exact official match: NOT CHECKED (LBA0 unreadable)");
     else {_snwprintf(b,511,L"Root MSFWUPGR.UPG exact official match: %s",g_rootPackageIntact?L"YES":L"NO");WriteUtf8Line(h,b);}
     if(g_rescueFreeKnown){_snwprintf(b,511,L"Rescued FAT current free bytes: %I64u",g_rescueFreeBytes);WriteUtf8Line(h,b);}
@@ -1262,14 +1339,21 @@ static void SavePublicReport(void) {
     else {_snwprintf(b,511,L"Recovery resume eligibility: %s",g_resumeEligible?L"YES":L"NO");WriteUtf8Line(h,b);}
     const WCHAR *pwState=(g_fbPwStatState==PROBE_SUCCESS)?L"SUCCESS":(g_fbPwStatState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbPwStatState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
     const WCHAR *diState=(g_fbDevInfoState==PROBE_SUCCESS)?L"SUCCESS":(g_fbDevInfoState==PROBE_FAILED)?L"ATTEMPTED-FAILED":(g_fbDevInfoState==PROBE_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
-    const WCHAR *a3State=(g_a3a4State==A3A4_SUCCESS)?L"SUCCESS":(g_a3a4State==A3A4_FAILED)?L"ATTEMPTED-FAILED":(g_a3a4State==A3A4_DECLINED)?L"DECLINED":L"NOT ATTEMPTED";
+    const WCHAR *a3State=(g_a3a4State==A3A4_SUCCESS)?L"SUCCESS":(g_a3a4State==A3A4_FAILED)?L"ATTEMPTED-FAILED":(g_a3a4State==A3A4_DECLINED)?L"DECLINED":(g_a3a4State==A3A4_BLOCKED_PREFLIGHT)?L"BLOCKED-PREFLIGHT":L"NOT ATTEMPTED";
+    WritePublicPreflightSummary(h,L"Stage 2A live state preflight",g_stage2aPreflightState,&g_pubStage2aPreflight);
     _snwprintf(b,511,L"FB/PW_STAT read-only compatibility probe: %s",pwState);WriteUtf8Line(h,b);
+    WritePublicScsiSummary(h,L"FB/PW_STAT SCSI result",&g_pubFbPwStat);
     if(g_fbPwStatOk){_snwprintf(b,511,L"FB/PW_STAT response SHA-256 only: %s",g_fbPwStatSha256);WriteUtf8Line(h,b);}
     _snwprintf(b,511,L"FB/DEVINFO read-only compatibility probe: %s",diState);WriteUtf8Line(h,b);
+    WritePublicScsiSummary(h,L"FB/DEVINFO SCSI result",&g_pubFbDevInfo);
     if(g_fbDevInfoOk){_snwprintf(b,511,L"FB/DEVINFO response SHA-256 only: %s",g_fbDevInfoSha256);WriteUtf8Line(h,b);}
+    WritePublicPreflightSummary(h,L"Stage 2B live state preflight",g_stage2bPreflightState,&g_pubStage2bPreflight);
     _snwprintf(b,511,L"A3/A4 Device-ID query: %s",a3State);WriteUtf8Line(h,b);
+    WritePublicScsiSummary(h,L"A3 fixed select SCSI result",&g_pubA3);
+    WritePublicScsiSummary(h,L"A4 Device-ID read SCSI result",&g_pubA4);
     if(g_vendorDvIdRead){_snwprintf(b,511,L"Device-ID SHA-256 only: %s",g_vendorDvIdSha256);WriteUtf8Line(h,b);}
-    WriteUtf8Line(h,L"PRIVATE: JSONL trace, metadata.bin, DvID bin, LBA/IMG, recovered UPG. Do NOT attach those to a public issue unless intentionally sharing their contents.");
+    WriteUtf8Line(h,L"PUBLIC upload rule: attach only this NW-E405_PUBLIC_REPORT_*.txt to GitHub Issue #1.");
+    WriteUtf8Line(h,L"PRIVATE: TXT journal, JSONL trace, metadata.bin, DvID/FB blobs, LBA/IMG, recovered UPG. Do NOT attach these to the public issue.");
     FlushFileBuffers(h);CloseHandle(h);
 }
 
@@ -1280,7 +1364,7 @@ static BOOL SaveLog(void) {
     return ok;
 }
 
-static BOOL RevalidateIssue1BeforeWrite(HANDLE h) {
+static BOOL RevalidateIssue1State(HANDLE h, const WCHAR *label, PublicPreflightSummary *pub) {
     BYTE cdb[16]={0};
     cdb[0]=0x12;cdb[4]=96;ScsiResult inq=SendCdb(h,cdb,6,96);
     WCHAR vendor[32]={0},product[64]={0};
@@ -1290,9 +1374,14 @@ static BOOL RevalidateIssue1BeforeWrite(HANDLE h) {
     ZeroMemory(cdb,sizeof(cdb));cdb[0]=0x25;ScsiResult cap=SendCdb(h,cdb,10,8);
     ZeroMemory(cdb,sizeof(cdb));cdb[0]=0xFC;cdb[2]=0x03;cdb[8]=0x08;ScsiResult fw=SendCdb(h,cdb,12,8);
     BOOL ok=ident&&IsSense3A00(&tur)&&IsSense3A00(&cap)&&IsKnownIssue1FwInfo(&fw);
-    LogF(L"FC/04 immediate preflight: identity=%s TUR3A00=%s CAP3A00=%s FC03-known=%s => %s",
-        ident?L"YES":L"NO",IsSense3A00(&tur)?L"YES":L"NO",IsSense3A00(&cap)?L"YES":L"NO",IsKnownIssue1FwInfo(&fw)?L"YES":L"NO",ok?L"PASS":L"FAIL");
+    if(pub){pub->attempted=TRUE;pub->identityOk=ident;pub->tur3a00=IsSense3A00(&tur);pub->cap3a00=IsSense3A00(&cap);pub->fc03Known=IsKnownIssue1FwInfo(&fw);}
+    LogF(L"%s: identity=%s TUR3A00=%s CAP3A00=%s FC03-known=%s => %s",
+        label?label:L"Issue #1 live preflight",ident?L"YES":L"NO",IsSense3A00(&tur)?L"YES":L"NO",IsSense3A00(&cap)?L"YES":L"NO",IsKnownIssue1FwInfo(&fw)?L"YES":L"NO",ok?L"PASS":L"FAIL");
     return ok;
+}
+
+static BOOL RevalidateIssue1BeforeWrite(HANDLE h) {
+    return RevalidateIssue1State(h,L"FC/04 immediate preflight",NULL);
 }
 
 static void ResumeVerifiedUpdate(void) {
@@ -1337,10 +1426,10 @@ static void RunRecoveryLadder(void) {
     if(g_lba0Unreadable){
         int fbans=MessageBoxW(g_hwnd,L"READ(10)でLBA0も読めませんでした。\n\n次に同世代Sony NW-A600公式Updaterで確認した読み取り専用vendor queryを2本だけ試せます。\n・FB/PW_STAT: DATA IN 32 bytes\n・FB/DEVINFO: DATA IN 128 bytes\n\nNW-E405純正Updaterにはこの拡張機能は無いため互換性は未確認です。PCから本体へdata payloadは送りません。\n\n試しますか？",L"Recovery Stage 2A - Sony FB read probes",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
         if(fbans==IDYES)ProbeA600ReadOnlyVendorInfo();
-        else {g_fbPwStatState=PROBE_DECLINED;g_fbDevInfoState=PROBE_DECLINED;}
+        else {g_fbPwStatState=PROBE_DECLINED;g_fbDevInfoState=PROBE_DECLINED;g_stage2aPreflightState=PROBE_NOT_ATTEMPTED;ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight));ZeroMemory(&g_pubFbPwStat,sizeof(g_pubFbPwStat));ZeroMemory(&g_pubFbDevInfo,sizeof(g_pubFbDevInfo));}
         SavePublicReport();
         int a3ans=MessageBoxW(g_hwnd,L"通常のREAD(10)経路ではLBA0も読めませんでした。\n\n同世代NW-A600純正Updater由来のread-only FB/PW_STAT・FB/DEVINFO互換性確認を実行しました。\n\n次にSony MP3 File ManagerのNW-E405純正実装由来A3/A4 Device-ID問い合わせを試します。\nA3は固定20バイトのselect DATA OUT、A4は18バイトのreadです。音楽領域やFWを書き換えるpayloadではありません。\n\n試しますか？",L"Recovery Stage 2 - A3/A4",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2);
-        if(a3ans==IDYES)QueryVendorDvId(); else g_a3a4State=A3A4_DECLINED;
+        if(a3ans==IDYES)QueryVendorDvId(); else {g_a3a4State=A3A4_DECLINED;g_stage2bPreflightState=PROBE_NOT_ATTEMPTED;ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight));ZeroMemory(&g_pubA3,sizeof(g_pubA3));ZeroMemory(&g_pubA4,sizeof(g_pubA4));}
         SavePublicReport();return;
     }
     LogF(L"Recovery Ladder stopped after read-only rescue analysis. No safe next write action is currently unlocked.");SavePublicReport();
@@ -1386,7 +1475,12 @@ static void RunDiagnostics(void) {
     g_noMediaRescueAvailable=FALSE; g_exactDevicePath[0]=0;
     g_metaInquiryLen=g_metaFc03Len=g_metaFc05Len=g_metaFc09Len=0;
     g_issue1TurNoMedia=g_issue1CapNoMedia=g_issue1FwInfoMatch=FALSE;
-    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0; g_fbPwStatOk=FALSE; g_fbDevInfoOk=FALSE; g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
+    g_lba0Unreadable=FALSE; g_rootPackageIntact=FALSE; g_resumeEligible=FALSE; g_vendorDvIdRead=FALSE; g_vendorDvIdSha256[0]=0;
+    g_fbPwStatOk=FALSE; g_fbDevInfoOk=FALSE; g_fbPwStatState=PROBE_NOT_ATTEMPTED; g_fbDevInfoState=PROBE_NOT_ATTEMPTED;
+    g_stage2aPreflightState=PROBE_NOT_ATTEMPTED; g_stage2bPreflightState=PROBE_NOT_ATTEMPTED; g_a3a4State=A3A4_NOT_ATTEMPTED;
+    ZeroMemory(&g_pubLba0,sizeof(g_pubLba0)); ZeroMemory(&g_pubFbPwStat,sizeof(g_pubFbPwStat)); ZeroMemory(&g_pubFbDevInfo,sizeof(g_pubFbDevInfo));
+    ZeroMemory(&g_pubA3,sizeof(g_pubA3)); ZeroMemory(&g_pubA4,sizeof(g_pubA4)); ZeroMemory(&g_pubStage2aPreflight,sizeof(g_pubStage2aPreflight)); ZeroMemory(&g_pubStage2bPreflight,sizeof(g_pubStage2bPreflight));
+    g_fbPwStatSha256[0]=0; g_fbDevInfoSha256[0]=0; g_rescueFreeKnown=FALSE; g_rescueFreeBytes=0;
     if(g_rescue)EnableWindow(g_rescue,FALSE);
     if (!StartSessionLogs()) {
         SetStatus(L"診断中止 — TXT/JSONLログを作成できません");

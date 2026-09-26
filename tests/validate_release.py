@@ -5,13 +5,16 @@ s=(root/'src/NW-E405-Recovery-Tool.c').read_text(encoding='utf-8')
 fwp=(root/'src/fw_package.c').read_text(encoding='utf-8')
 allc=s+'\n'+fwp
 checks={
- 'v0.8 recovery build':'NW-E405 Recovery Tool v0.8-dev' in s,
+ 'v0.8.1 recovery build':'NW-E405 Recovery Tool v0.8.1-dev' in s,
  'exact VID/PID':'VID_054C&PID_01FB' in s,
  'exact SCSI identity':'NWWM MEM AAD2' in s,
  'exactly one DATA OUT implementation':allc.count('SCSI_IOCTL_DATA_OUT')==1 and 'SendFixedA3SelectDeviceId' in s,
  'A600 FB PW_STAT fixed DATA-IN probe':"BYTE pwCdb[12]={0xFB,0,0,'P','W','_','S','T','A','T',0x20,0};" in s and 'SendCdb(h,pwCdb,12,32)' in s,
  'A600 FB DEVINFO fixed DATA-IN probe':"BYTE diCdb[12]={0xFB,0,0,'D','E','V','I','N','F','O',0x80,0};" in s and 'SendCdb(h,diCdb,12,128)' in s,
  'probe state reporting':'ATTEMPTED-FAILED' in s and 'DECLINED' in s and 'NOT ATTEMPTED' in s,
+ 'public SCSI summaries':'LBA0 READ(10) result' in s and 'FB/PW_STAT SCSI result' in s and 'A3 fixed select SCSI result' in s and 'A4 Device-ID read SCSI result' in s,
+ 'stage2 live revalidation':'Stage 2A live preflight' in s and 'Stage 2B live preflight' in s and 'identity=%s TUR3A00=%s CAP3A00=%s FC03-known=%s' in s,
+ 'public-only upload rule':'PUBLIC upload rule: attach only this NW-E405_PUBLIC_REPORT_*.txt' in s and 'TXT/JSONLと一緒にIssue #1へ添付してください' not in s,
  'fixed A3 CDB':'0xA3,0,0,0,0,0,0,0xBC,0,0x14,0x30,0' in s,
  'fixed A3 payload':'BYTE payload[20]={0}; payload[1]=0x12;' in s,
  'fixed A4 CDB':'0xA4,0,0,0,0,0,0,0xBC,0,0x12,0x3F,0' in s,
